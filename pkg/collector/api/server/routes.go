@@ -33,13 +33,15 @@ func (s *Server) adminRoutes(r *mux.Router) {
 }
 
 func (s *Server) clusterRoutes(r *mux.Router) {
-	r.HandleFunc("/cluster", s.handleClusteringGet).Methods(http.MethodGet)
-	r.HandleFunc("/cluster/rebalance", s.handleClusterRebalance).Methods(http.MethodPost)
-	r.HandleFunc("/cluster/leader", s.handleClusteringLeaderGet).Methods(http.MethodGet)
-	r.HandleFunc("/cluster/leader", s.handleClusteringLeaderDelete).Methods(http.MethodDelete)
-	r.HandleFunc("/cluster/members", s.handleClusteringMembersGet).Methods(http.MethodGet)
-	r.HandleFunc("/cluster/members/{id}/drain", s.handleClusteringDrainInstance).Methods(http.MethodPost)
-	r.HandleFunc("/cluster/move", s.handleClusterMove).Methods(http.MethodPost) // TODO: implement move target
+	cluster := r.PathPrefix("/cluster").Subrouter()
+	cluster.Use(s.requireClustering)
+	cluster.HandleFunc("", s.handleClusteringGet).Methods(http.MethodGet)
+	cluster.HandleFunc("/rebalance", s.handleClusterRebalance).Methods(http.MethodPost)
+	cluster.HandleFunc("/leader", s.handleClusteringLeaderGet).Methods(http.MethodGet)
+	cluster.HandleFunc("/leader", s.handleClusteringLeaderDelete).Methods(http.MethodDelete)
+	cluster.HandleFunc("/members", s.handleClusteringMembersGet).Methods(http.MethodGet)
+	cluster.HandleFunc("/members/{id}/drain", s.handleClusteringDrainInstance).Methods(http.MethodPost)
+	cluster.HandleFunc("/move", s.handleClusterMove).Methods(http.MethodPost)
 }
 
 func (s *Server) configRoutes(r *mux.Router) {

@@ -29,6 +29,17 @@ type clusterMember struct {
 	LockedTargets         []string `json:"locked-targets,omitempty"`
 }
 
+func (s *Server) requireClustering(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.locker == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(APIErrors{Errors: []string{"clustering is not enabled"}})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func (s *Server) handleClusteringGet(w http.ResponseWriter, r *http.Request) {
 	// clusteringResponse
 	clusteringCfg, ok, err := s.store.Config.Get("clustering", "clustering")
