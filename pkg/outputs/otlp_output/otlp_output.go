@@ -1,4 +1,4 @@
-// © 2025 NVIDIA Corporation
+// © 2025-2026 NVIDIA Corporation
 //
 // This code is a Contribution to the gNMIc project ("Work") made under the Google Software Grant and Corporate Contributor License Agreement ("CLA") and governed by the Apache License 2.0.
 // No other rights or licenses in or to any of NVIDIA's intellectual property are granted for any other purpose.
@@ -115,6 +115,11 @@ type config struct {
 	// and the string stored as an attribute named "value".
 	// if false, string values are dropped.
 	StringsAsAttributes bool `mapstructure:"strings-as-attributes,omitempty"`
+	// boolean, if true, the leading "/" of the metric path is trimmed before the
+	// slash-to-underscore conversion, so a path like "/interfaces/..." becomes
+	// "interfaces_..." instead of "_interfaces_...". Defaults to false for
+	// backward compatibility.
+	StripLeadingUnderscore bool `mapstructure:"strip-leading-underscore,omitempty"`
 
 	// Tags whose values are placed as OTLP Resource attributes and excluded
 	// from data point attributes.

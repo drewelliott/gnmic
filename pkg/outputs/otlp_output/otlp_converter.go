@@ -1,4 +1,4 @@
-// © 2025 NVIDIA Corporation
+// © 2025-2026 NVIDIA Corporation
 //
 // This code is a Contribution to the gNMIc project ("Work") made under the Google Software Grant and Corporate Contributor License Agreement ("CLA") and governed by the Apache License 2.0.
 // No other rights or licenses in or to any of NVIDIA's intellectual property are granted for any other purpose.
@@ -233,7 +233,13 @@ func (o *otlpOutput) buildMetricName(cfg *config, event *formatters.EventMsg, va
 
 	// Append the value key (metric path), converting slashes to underscores
 	// e.g., "interfaces/interface/state/counters/in-octets" -> "interfaces_interface_state_counters_in_octets"
-	metricPath := strings.ReplaceAll(valueKey, "/", "_")
+	// gNMI paths arrive with a leading "/"; strip it when configured so the conversion
+	// does not produce a leading "_" (or a double "_" when a prefix is set).
+	path := valueKey
+	if cfg.StripLeadingUnderscore {
+		path = strings.TrimPrefix(path, "/")
+	}
+	metricPath := strings.ReplaceAll(path, "/", "_")
 	sb.WriteString(metricPath)
 
 	name := sb.String()
