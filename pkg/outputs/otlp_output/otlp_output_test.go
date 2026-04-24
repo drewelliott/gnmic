@@ -620,6 +620,101 @@ func TestExtractAttributesForMetric_NoDivergenceMatchesOriginalBehavior(t *testi
 	assert.Equal(t, "RE0", v)
 }
 
+// TestGroupByResource_PrefersDeviceOverTargetAndSource pins the preference
+// order: when device is present, it is used as the group key regardless of
+// whether target or source is also present. device is the most stable and
+// human-readable identifier of the producing entity, so it leads the chain.
+func TestGroupByResource_PrefersDeviceOverTargetAndSource(t *testing.T) {
+	output := newTestOutput(&config{})
+
+	events := []*formatters.EventMsg{
+		{Tags: map[string]string{"device": "bbr2", "target": "bbr2-t", "source": "10.1.1.1:6030"}},
+		{Tags: map[string]string{"device": "bbr2", "target": "bbr2-t", "source": "10.1.1.1:6030"}},
+		{Tags: map[string]string{"device": "fnx5", "target": "fnx5-t", "source": "10.2.2.2:6030"}},
+	}
+
+	groups := output.groupByResource(events)
+
+	assert.Len(t, groups["bbr2"], 2, "device leads the preference chain")
+	assert.Len(t, groups["fnx5"], 1)
+	_, ok := groups["10.1.1.1:6030"]
+	assert.False(t, ok, "source must not be used when device is present")
+}
+
+// TestGroupByResource_UsesSourceWhenDeviceAndTargetAbsent verifies that when
+// only source is present, it is still used as the group key — matching
+// behavior prior to this change for deployments that have not set device or
+// target tags.
+func TestGroupByResource_UsesSourceWhenDeviceAndTargetAbsent(t *testing.T) {
+	output := newTestOutput(&config{})
+
+	events := []*formatters.EventMsg{
+		{Tags: map[string]string{"source": "10.1.1.1:6030"}},
+		{Tags: map[string]string{"source": "10.2.2.2:6030"}},
+	}
+
+	groups := output.groupByResource(events)
+
+	assert.Len(t, groups["10.1.1.1:6030"], 1)
+	assert.Len(t, groups["10.2.2.2:6030"], 1)
+}
+
+// TestGroupByResource_FallsBackToDeviceWhenSourceAbsent verifies that when
+// events have no source tag (e.g., stripped by a processor because it
+// duplicates device), grouping falls back to device so per-target Resource
+// isolation is preserved.
+func TestGroupByResource_FallsBackToDeviceWhenSourceAbsent(t *testing.T) {
+	output := newTestOutput(&config{})
+
+	events := []*formatters.EventMsg{
+		{Tags: map[string]string{"device": "bbr2"}},
+		{Tags: map[string]string{"device": "bbr2"}},
+		{Tags: map[string]string{"device": "fnx5"}},
+	}
+
+	groups := output.groupByResource(events)
+
+	assert.Len(t, groups["bbr2"], 2)
+	assert.Len(t, groups["fnx5"], 1)
+	_, ok := groups["unknown"]
+	assert.False(t, ok, "unknown bucket must not be populated when device is present")
+}
+
+// TestGroupByResource_FallsBackToTargetWhenSourceAndDeviceAbsent verifies the
+// third step of the fallback chain: when both source and device are absent,
+// fall back to target.
+func TestGroupByResource_FallsBackToTargetWhenSourceAndDeviceAbsent(t *testing.T) {
+	output := newTestOutput(&config{})
+
+	events := []*formatters.EventMsg{
+		{Tags: map[string]string{"target": "bbr2-logical"}},
+		{Tags: map[string]string{"target": "bbr2-logical"}},
+	}
+
+	groups := output.groupByResource(events)
+
+	assert.Len(t, groups["bbr2-logical"], 2)
+	_, ok := groups["unknown"]
+	assert.False(t, ok)
+}
+
+// TestGroupByResource_FallsBackToUnknownAsLastResort documents that when the
+// whole fallback chain is empty, events collapse into a literal "unknown"
+// bucket. This is the same landmine behavior as before the fallback chain —
+// preserved as a last resort.
+func TestGroupByResource_FallsBackToUnknownAsLastResort(t *testing.T) {
+	output := newTestOutput(&config{})
+
+	events := []*formatters.EventMsg{
+		{Tags: map[string]string{"unrelated": "x"}},
+		{Tags: map[string]string{"unrelated": "y"}},
+	}
+
+	groups := output.groupByResource(events)
+
+	assert.Len(t, groups["unknown"], 2)
+}
+
 // Helper functions
 
 func createTestEvent() *formatters.EventMsg {
