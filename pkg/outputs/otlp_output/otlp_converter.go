@@ -103,17 +103,29 @@ func (o *otlpOutput) convertToOTLP(events []*formatters.EventMsg) *metricsv1.Exp
 	return req
 }
 
-// groupByResource groups events by their source (device) for resource attribution
+// groupByResource groups events by a stable identifier of the producing
+// entity so that each group becomes one OTLP Resource. The key is taken from
+// the first non-empty tag in the preference chain device -> target -> source,
+// falling back to the literal "unknown" only when all three are absent.
+// Preferring device over source prevents cross-target contamination in
+// deployments that legitimately strip source (e.g., because it duplicates
+// device), which previously collapsed every target into a single "unknown"
+// bucket.
 func (o *otlpOutput) groupByResource(events []*formatters.EventMsg) map[string][]*formatters.EventMsg {
 	groups := make(map[string][]*formatters.EventMsg)
 
 	for _, event := range events {
-		// Use source as resource key
-		source := event.Tags["source"]
-		if source == "" {
-			source = "unknown"
+		key := event.Tags["device"]
+		if key == "" {
+			key = event.Tags["target"]
 		}
-		groups[source] = append(groups[source], event)
+		if key == "" {
+			key = event.Tags["source"]
+		}
+		if key == "" {
+			key = "unknown"
+		}
+		groups[key] = append(groups[key], event)
 	}
 
 	return groups
