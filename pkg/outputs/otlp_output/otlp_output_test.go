@@ -424,6 +424,202 @@ func TestBuildMetricName_StripLeadingUnderscore(t *testing.T) {
 	}
 }
 
+// getResourceAttr returns the value of an attribute on a Resource, and whether it was present.
+func getResourceAttr(r interface{ GetAttributes() []*commonpb.KeyValue }, key string) (string, bool) {
+	for _, a := range r.GetAttributes() {
+	    if a.Key == key {
+	        return a.Value.GetStringValue(), true
+	    }
+	}
+	return "", false
+}
+
+// getAttr returns the value of an attribute in a KeyValue slice, and whether it was present.
+func getAttr(attrs []*commonpb.KeyValue, key string) (string, bool) {
+	for _, a := range attrs {
+		if a.Key == key {
+			return a.Value.GetStringValue(), true
+		}
+	}
+	return "", false
+}
+
+// TestCreateResource_UniformTagsPromoted pins the backward-compatible path:
+// when every event in the group agrees on a resource-tag-keys value, that tag
+// is promoted to the Resource and not flagged as divergent.
+func TestCreateResource_UniformTagsPromoted(t *testing.T) {
+	cfg := &config{
+		ResourceTagKeys: []string{"device", "model", "vendor"},
+	}
+	output := newTestOutput(cfg)
+
+	events := []*formatters.EventMsg{
+		{Tags: map[string]string{"device": "bbr2", "model": "junos", "vendor": "juniper", "component_name": "RE0"}},
+		{Tags: map[string]string{"device": "bbr2", "model": "junos", "vendor": "juniper", "component_name": "FPC0"}},
+	}
+
+	resource, divergent := output.createResource(cfg, events)
+
+	device, ok := getResourceAttr(resource, "device")
+	require.True(t, ok, "device should be on Resource")
+	assert.Equal(t, "bbr2", device)
+
+	model, ok := getResourceAttr(resource, "model")
+	require.True(t, ok)
+	assert.Equal(t, "junos", model)
+
+	assert.Empty(t, divergent, "no divergent keys expected when all events agree")
+}
+
+// TestCreateResource_DivergentTagsInDivergenceSet is the spec-violation fix:
+// when a resource-tag-keys value varies across events in the group, the tag
+// is omitted from Resource and reported in the divergence set so that the
+// per-datapoint attribute extraction can route it correctly.
+func TestCreateResource_DivergentTagsInDivergenceSet(t *testing.T) {
+	cfg := &config{
+		ResourceTagKeys: []string{"device", "serial_no"},
+	}
+	output := newTestOutput(cfg)
+
+	events := []*formatters.EventMsg{
+		{Tags: map[string]string{"device": "bbr2", "serial_no": "BUILTIN"}},
+		{Tags: map[string]string{"device": "bbr2", "serial_no": "1W1CUPAA04012"}},
+	}
+
+	resource, divergent := output.createResource(cfg, events)
+
+	device, ok := getResourceAttr(resource, "device")
+	require.True(t, ok)
+	assert.Equal(t, "bbr2", device, "uniform tag still promoted")
+
+	_, ok = getResourceAttr(resource, "serial_no")
+	assert.False(t, ok, "divergent tag must not appear on Resource")
+
+	assert.True(t, divergent["serial_no"], "serial_no must be flagged as divergent")
+	assert.False(t, divergent["device"], "device should not be flagged")
+}
+
+// TestCreateResource_MissingFromSomeEventsIsLenient pins the lenient semantic:
+// a tag present in some events and absent in others, where the present events
+// all agree, is still promoted to Resource. Absence does not count as divergence.
+func TestCreateResource_MissingFromSomeEventsIsLenient(t *testing.T) {
+	cfg := &config{
+		ResourceTagKeys: []string{"model"},
+	}
+	output := newTestOutput(cfg)
+
+	events := []*formatters.EventMsg{
+		{Tags: map[string]string{"model": "junos"}},
+		{Tags: map[string]string{}}, // model absent
+		{Tags: map[string]string{"model": "junos"}},
+	}
+
+	resource, divergent := output.createResource(cfg, events)
+
+	model, ok := getResourceAttr(resource, "model")
+	require.True(t, ok, "model should be promoted when present events agree")
+	assert.Equal(t, "junos", model)
+	assert.False(t, divergent["model"])
+}
+
+// TestCreateResource_MissingFromAllEventsSkipped verifies that a resource-tag-key
+// absent from every event in the group is neither promoted nor flagged as divergent.
+func TestCreateResource_MissingFromAllEventsSkipped(t *testing.T) {
+	cfg := &config{
+		ResourceTagKeys: []string{"vendor"},
+	}
+	output := newTestOutput(cfg)
+
+	events := []*formatters.EventMsg{
+		{Tags: map[string]string{"device": "bbr2"}},
+		{Tags: map[string]string{"device": "bbr2"}},
+	}
+
+	resource, divergent := output.createResource(cfg, events)
+
+	_, ok := getResourceAttr(resource, "vendor")
+	assert.False(t, ok, "absent tag not promoted")
+	assert.False(t, divergent["vendor"], "absent tag not divergent either")
+}
+
+// TestCreateResource_ResourceAttributesStillAppended verifies that the static
+// cfg.ResourceAttributes map continues to be merged into the Resource regardless
+// of divergence handling for resource-tag-keys.
+func TestCreateResource_ResourceAttributesStillAppended(t *testing.T) {
+	cfg := &config{
+		ResourceTagKeys:    []string{"device"},
+		ResourceAttributes: map[string]string{"telemetry.source": "gnmi"},
+	}
+	output := newTestOutput(cfg)
+
+	events := []*formatters.EventMsg{
+		{Tags: map[string]string{"device": "bbr2"}},
+	}
+
+	resource, _ := output.createResource(cfg, events)
+
+	v, ok := getResourceAttr(resource, "telemetry.source")
+	require.True(t, ok)
+	assert.Equal(t, "gnmi", v)
+}
+
+// TestExtractAttributesForMetric_DivergentKeysIncluded verifies that when a
+// resource-tag-key is flagged as divergent for the current group, the event's
+// own value for that key flows through to datapoint attributes with its correct
+// per-event value instead of being excluded as a resource-only tag.
+func TestExtractAttributesForMetric_DivergentKeysIncluded(t *testing.T) {
+	cfg := &config{
+		ResourceTagKeys: []string{"device", "serial_no"},
+	}
+	output := newTestOutput(cfg)
+
+	event := &formatters.EventMsg{Tags: map[string]string{
+		"device":         "bbr2",
+		"serial_no":      "BUILTIN",
+		"component_name": "RE0",
+	}}
+	divergent := map[string]bool{"serial_no": true}
+
+	attrs := output.extractAttributesForMetric(cfg, divergent, event)
+
+	v, ok := getAttr(attrs, "serial_no")
+	require.True(t, ok, "divergent resource-tag-key must appear on datapoint attrs")
+	assert.Equal(t, "BUILTIN", v, "with this event's correct value")
+
+	_, ok = getAttr(attrs, "device")
+	assert.False(t, ok, "non-divergent resource-tag-key still excluded from datapoint attrs")
+
+	v, ok = getAttr(attrs, "component_name")
+	require.True(t, ok, "non-resource tag still on datapoint attrs")
+	assert.Equal(t, "RE0", v)
+}
+
+// TestExtractAttributesForMetric_NoDivergenceMatchesOriginalBehavior is a
+// regression pin: when no keys are divergent, datapoint attrs exclude every
+// resource-tag-key — matching behavior prior to this change.
+func TestExtractAttributesForMetric_NoDivergenceMatchesOriginalBehavior(t *testing.T) {
+	cfg := &config{
+		ResourceTagKeys: []string{"device", "model"},
+	}
+	output := newTestOutput(cfg)
+
+	event := &formatters.EventMsg{Tags: map[string]string{
+		"device":         "bbr2",
+		"model":          "junos",
+		"component_name": "RE0",
+	}}
+
+	attrs := output.extractAttributesForMetric(cfg, map[string]bool{}, event)
+
+	_, ok := getAttr(attrs, "device")
+	assert.False(t, ok)
+	_, ok = getAttr(attrs, "model")
+	assert.False(t, ok)
+	v, ok := getAttr(attrs, "component_name")
+	require.True(t, ok)
+	assert.Equal(t, "RE0", v)
+}
+
 // Helper functions
 
 func createTestEvent() *formatters.EventMsg {
