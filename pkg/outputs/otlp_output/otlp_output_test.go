@@ -1,4 +1,4 @@
-// © 2025 NVIDIA Corporation
+// © 2025-2026 NVIDIA Corporation
 //
 // This code is a Contribution to the gNMIc project ("Work") made under the Google Software Grant and Corporate Contributor License Agreement ("CLA") and governed by the Apache License 2.0.
 // No other rights or licenses in or to any of NVIDIA's intellectual property are granted for any other purpose.
@@ -350,6 +350,78 @@ func TestOTLP_SubscriptionNameMapping(t *testing.T) {
 	// Then: subscription_name should be in attributes
 	dataPoint := otlpMetrics.ResourceMetrics[0].ScopeMetrics[0].Metrics[0].GetSum().DataPoints[0]
 	assert.Equal(t, "arista", getDataPointAttribute(dataPoint, "subscription_name"))
+}
+
+// TestBuildMetricName_StripLeadingUnderscore verifies the strip-leading-underscore config option.
+// gNMI paths arrive with a leading "/" (see pkg/formatters/event.go updateToEvent), which the
+// slash->underscore conversion turns into a leading "_". This test pins both the backward-compatible
+// default (option off) and the new behavior (option on).
+func TestBuildMetricName_StripLeadingUnderscore(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      *config
+		event    *formatters.EventMsg
+		valueKey string
+		expected string
+	}{
+		{
+			name:     "default preserves leading underscore (backward compat)",
+			cfg:      &config{},
+			event:    &formatters.EventMsg{Name: "sub1"},
+			valueKey: "/interfaces/interface/state/counters/in-octets",
+			expected: "_interfaces_interface_state_counters_in_octets",
+		},
+		{
+			name:     "enabled removes leading underscore",
+			cfg:      &config{StripLeadingUnderscore: true},
+			event:    &formatters.EventMsg{Name: "sub1"},
+			valueKey: "/interfaces/interface/state/counters/in-octets",
+			expected: "interfaces_interface_state_counters_in_octets",
+		},
+		{
+			name:     "disabled with metric-prefix yields double underscore (backward compat)",
+			cfg:      &config{MetricPrefix: "gnmic"},
+			event:    &formatters.EventMsg{Name: "sub1"},
+			valueKey: "/interfaces/interface/state/counters/in-octets",
+			expected: "gnmic__interfaces_interface_state_counters_in_octets",
+		},
+		{
+			name:     "enabled with metric-prefix has single underscore separator",
+			cfg:      &config{StripLeadingUnderscore: true, MetricPrefix: "gnmic"},
+			event:    &formatters.EventMsg{Name: "sub1"},
+			valueKey: "/interfaces/interface/state/counters/in-octets",
+			expected: "gnmic_interfaces_interface_state_counters_in_octets",
+		},
+		{
+			name:     "enabled with append-subscription-name has single underscore separator",
+			cfg:      &config{StripLeadingUnderscore: true, AppendSubscriptionName: true},
+			event:    &formatters.EventMsg{Name: "arista"},
+			valueKey: "/interfaces/interface/state/counters/in-octets",
+			expected: "arista_interfaces_interface_state_counters_in_octets",
+		},
+		{
+			name:     "enabled does not touch non-leading underscores",
+			cfg:      &config{StripLeadingUnderscore: true},
+			event:    &formatters.EventMsg{Name: "sub1"},
+			valueKey: "/a_b/c",
+			expected: "a_b_c",
+		},
+		{
+			name:     "enabled is a no-op when path has no leading slash",
+			cfg:      &config{StripLeadingUnderscore: true},
+			event:    &formatters.EventMsg{Name: "sub1"},
+			valueKey: "interfaces/interface",
+			expected: "interfaces_interface",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output := newTestOutput(tt.cfg)
+			got := output.buildMetricName(tt.cfg, tt.event, tt.valueKey)
+			assert.Equal(t, tt.expected, got)
+		})
+	}
 }
 
 // Helper functions
