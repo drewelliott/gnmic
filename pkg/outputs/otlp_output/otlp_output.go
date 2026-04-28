@@ -47,6 +47,10 @@ const (
 	defaultMaxRetries = 3
 	defaultProtocol   = "grpc"
 	loggingPrefix     = "[otlp_output:%s] "
+	// maxRetryAfter caps a server-supplied Retry-After to prevent a single bad
+	// response from pinning a worker for arbitrarily long. Operators rebalancing
+	// or upgrading Panoptes occasionally emit large values.
+	maxRetryAfter = 30 * time.Second
 )
 
 func init() {
@@ -555,7 +559,16 @@ func (o *otlpOutput) sendBatch(ctx context.Context, events []*formatters.EventMs
 
 	var err error
 	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
-		err = o.sendGRPC(ctx, req)
+		switch cfg.Protocol {
+		case "grpc":
+			err = o.sendGRPC(ctx, req)
+		case "http":
+			err = o.sendHTTP(ctx, req)
+		default:
+			// validateConfig should reject anything else at Init and reload;
+			// surface clearly if it leaks through.
+			err = fmt.Errorf("unsupported protocol %q", cfg.Protocol)
+		}
 
 		if err == nil {
 			if cfg.Debug {
@@ -568,8 +581,21 @@ func (o *otlpOutput) sendBatch(ctx context.Context, events []*formatters.EventMs
 			return
 		}
 
+		// HTTP-only: permanent errors abort the loop; Retry-After overrides our backoff.
+		if cfg.Protocol == "http" && isPermanentHTTPError(err) {
+			o.logger.Printf("permanent HTTP error, not retrying: %v", err)
+			break
+		}
+
 		if attempt < cfg.MaxRetries {
-			time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+			sleep := effectiveRetrySleep(cfg.Protocol, attempt, retryAfterFromError(err), maxRetryAfter)
+			// Use a select on ctx.Done so Close()/cancellation can interrupt a long
+			// Retry-After or backoff sleep instead of pinning the worker.
+			select {
+			case <-time.After(sleep):
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 

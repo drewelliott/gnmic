@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/openconfig/gnmic/pkg/api/types"
+	"github.com/openconfig/gnmic/pkg/formatters"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	metricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -726,4 +727,134 @@ func TestSendHTTP_PartialSuccessIncrementsMetric(t *testing.T) {
 	require.Error(t, err)
 	after := testutil.ToFloat64(otlpRejectedDataPoints.WithLabelValues(cfgName))
 	require.Equal(t, float64(3), after-before, "metric must advance by RejectedDataPoints")
+}
+
+func TestSendHTTP_RetryAfterHeaderHonored(t *testing.T) {
+	start := time.Now()
+	var callTimes []time.Time
+	var calls int
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		callTimes = append(callTimes, time.Now())
+		calls++
+		if calls <= 1 {
+			w.Header().Set("Retry-After", "1") // 1 second
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	withCfg(o, func(c *config) {
+		c.MaxRetries = 3
+		c.resourceTagSet = map[string]bool{}
+	})
+
+	// Build one event and run through the public sendBatch path so we exercise the retry loop.
+	events := []*formatters.EventMsg{{
+		Name: "test", Timestamp: time.Now().UnixNano(),
+		Tags:   map[string]string{"source": "x"},
+		Values: map[string]interface{}{"value": int64(1)},
+	}}
+	o.sendBatch(context.Background(), events)
+
+	require.GreaterOrEqual(t, calls, 2, "should retry at least once")
+	require.GreaterOrEqual(t, time.Since(start), 1*time.Second, "must wait >=1s per Retry-After")
+}
+
+func TestSendHTTP_PermanentErrorStopsRetryLoop(t *testing.T) {
+	var calls int
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusBadRequest)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	withCfg(o, func(c *config) {
+		c.MaxRetries = 5
+		c.resourceTagSet = map[string]bool{}
+	})
+
+	events := []*formatters.EventMsg{{
+		Name: "test", Timestamp: time.Now().UnixNano(),
+		Tags:   map[string]string{"source": "x"},
+		Values: map[string]interface{}{"value": int64(1)},
+	}}
+	o.sendBatch(context.Background(), events)
+
+	require.Equal(t, 1, calls, "permanent 400 must not retry")
+}
+
+// Table-driven decision-path coverage for effectiveRetrySleep.
+func TestEffectiveRetrySleep_Table(t *testing.T) {
+	const testCap = 30 * time.Second
+	cases := []struct {
+		name       string
+		protocol   string
+		attempt    int
+		retryAfter time.Duration
+		want       time.Duration
+	}{
+		{"grpc_attempt0_no_retry_after", "grpc", 0, 0, 100 * time.Millisecond},
+		{"grpc_attempt2_no_retry_after", "grpc", 2, 0, 300 * time.Millisecond},
+		{"grpc_ignores_retry_after", "grpc", 0, 5 * time.Second, 100 * time.Millisecond},
+		{"http_attempt0_no_retry_after", "http", 0, 0, 100 * time.Millisecond},
+		{"http_attempt1_falls_back_to_backoff", "http", 1, 0, 200 * time.Millisecond},
+		{"http_zero_retry_after_falls_back", "http", 0, 0, 100 * time.Millisecond},
+		{"http_negative_retry_after_falls_back", "http", 0, -time.Second, 100 * time.Millisecond},
+		{"http_retry_after_under_cap_used", "http", 0, 5 * time.Second, 5 * time.Second},
+		{"http_retry_after_at_cap_used", "http", 0, testCap, testCap},
+		{"http_retry_after_above_cap_clamped", "http", 0, 5 * time.Minute, testCap},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := effectiveRetrySleep(tc.protocol, tc.attempt, tc.retryAfter, testCap)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// Decision-path: retryAfterFromError must return 0 for plain (non-typed) errors.
+// The Retry-After-honoring tests cover the typed-error path.
+func TestRetryAfterFromError_NonHTTPError(t *testing.T) {
+	require.Equal(t, time.Duration(0), retryAfterFromError(fmt.Errorf("plain error")))
+	require.Equal(t, time.Duration(0), retryAfterFromError(nil))
+}
+
+// Decision-path: a Retry-After sleep must be interruptible by ctx cancellation
+// so Close() during a retry doesn't pin the worker.
+func TestSendBatch_ContextCancelledDuringRetryWait(t *testing.T) {
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		// Always 503 with a long Retry-After so the loop wants to sleep >=1s.
+		w.Header().Set("Retry-After", "5")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	withCfg(o, func(c *config) {
+		c.MaxRetries = 5
+		c.resourceTagSet = map[string]bool{}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(150 * time.Millisecond) // give first attempt time to fail and start sleeping
+		cancel()
+	}()
+
+	events := []*formatters.EventMsg{{
+		Name: "test", Timestamp: time.Now().UnixNano(),
+		Tags:   map[string]string{"source": "x"},
+		Values: map[string]interface{}{"value": int64(1)},
+	}}
+
+	start := time.Now()
+	o.sendBatch(ctx, events)
+	elapsed := time.Since(start)
+
+	// Cancellation should land well before the 5-second Retry-After elapses.
+	require.Less(t, elapsed, 2*time.Second, "ctx cancel must interrupt the retry sleep")
 }

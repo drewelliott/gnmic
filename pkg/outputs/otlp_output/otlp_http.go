@@ -291,3 +291,35 @@ func (o *otlpOutput) sendHTTP(ctx context.Context, req *metricsv1.ExportMetricsS
 		msg:        string(bodySnippet[:n]),
 	}
 }
+
+// retryAfterFromError returns the Retry-After duration from a wrapped
+// httpExportError, or 0 if no hint is available.
+func retryAfterFromError(err error) time.Duration {
+	var hee *httpExportError
+	if errors.As(err, &hee) {
+		return hee.retryAfter
+	}
+	return 0
+}
+
+// effectiveRetrySleep computes how long the retry loop should sleep before the
+// next attempt, given the protocol, attempt index, server-supplied Retry-After
+// hint, and our configured maxSleep cap. Extracted so the cap branch is
+// unit-testable without 30-second sleeps in tests.
+//
+// gRPC: always linear backoff (attempt+1) * 100ms. Retry-After is ignored.
+// HTTP: Retry-After (capped at maxSleep) overrides linear backoff when > 0,
+//
+//	otherwise falls back to the same linear backoff.
+//
+// Param `maxSleep` is named so to avoid shadowing the `cap` builtin.
+func effectiveRetrySleep(protocol string, attempt int, retryAfter, maxSleep time.Duration) time.Duration {
+	backoff := time.Duration(attempt+1) * 100 * time.Millisecond
+	if protocol != "http" || retryAfter <= 0 {
+		return backoff
+	}
+	if retryAfter > maxSleep {
+		return maxSleep
+	}
+	return retryAfter
+}
