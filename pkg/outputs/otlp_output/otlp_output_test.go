@@ -916,3 +916,13 @@ func extractAttributesMap(attrs []*commonpb.KeyValue) map[string]string {
 	}
 	return result
 }
+
+// TestOTLP_HTTPTransport_EndToEnd verifies that configuring protocol: http
+// results in a working mTLS-authenticated POST to /v1/metrics.
+// This is the north-star test — it stays failing (skipped) until all tasks complete.
+func TestOTLP_HTTPTransport_EndToEnd(t *testing.T) {
+	// Spin up an mTLS httptest server that requires client cert,
+	// decodes the protobuf body, and returns 200 on /v1/metrics.
+	// (Helpers created in Task 2 + 3.)
+	t.Skip("north-star: un-skip after Task 12")
+}
