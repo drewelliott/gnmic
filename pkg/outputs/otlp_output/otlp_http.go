@@ -112,7 +112,11 @@ func (o *otlpOutput) initHTTPFor(cfg *config) (*httpClientState, error) {
 	}
 
 	transport := &http.Transport{
-		TLSClientConfig:       tlsConfig,
+		TLSClientConfig: tlsConfig,
+		// TLSHandshakeTimeout matches http.DefaultTransport's value; without this
+		// a hung TLS server could stall the dialer indefinitely even though we
+		// rely on per-request context deadlines.
+		TLSHandshakeTimeout:   10 * time.Second,
 		MaxIdleConns:          10,
 		MaxIdleConnsPerHost:   10,
 		IdleConnTimeout:       90 * time.Second,
@@ -129,7 +133,9 @@ func (o *otlpOutput) initHTTPFor(cfg *config) (*httpClientState, error) {
 		// matching the gRPC path (which uses context.WithTimeout in sendGRPC).
 	}
 
-	endpoint, err := resolveMetricsURL(cfg.Endpoint, cfg.TLS != nil)
+	// Pass the already-trimmed `endpoint` through (not cfg.Endpoint) so the
+	// coherence check above and URL resolution operate on the same string.
+	resolvedURL, err := resolveMetricsURL(endpoint, cfg.TLS != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -141,6 +147,6 @@ func (o *otlpOutput) initHTTPFor(cfg *config) (*httpClientState, error) {
 	hdr.Set("Content-Type", "application/x-protobuf")
 	// Compression header is set per-request in sendHTTP if compression is enabled.
 
-	o.logger.Printf("initialized OTLP HTTP client for endpoint: %s", endpoint)
-	return &httpClientState{client: client, endpoint: endpoint, headers: hdr}, nil
+	o.logger.Printf("initialized OTLP HTTP client for endpoint: %s", resolvedURL)
+	return &httpClientState{client: client, endpoint: resolvedURL, headers: hdr}, nil
 }
