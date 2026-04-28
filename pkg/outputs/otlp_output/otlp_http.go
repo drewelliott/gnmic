@@ -9,13 +9,19 @@
 package otlp_output
 
 import (
+	"bytes"
+	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	metricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 const otlpHTTPMetricsPath = "/v1/metrics"
@@ -149,4 +155,47 @@ func (o *otlpOutput) initHTTPFor(cfg *config) (*httpClientState, error) {
 
 	o.logger.Printf("initialized OTLP HTTP client for endpoint: %s", resolvedURL)
 	return &httpClientState{client: client, endpoint: resolvedURL, headers: hdr}, nil
+}
+
+func (o *otlpOutput) sendHTTP(ctx context.Context, req *metricsv1.ExportMetricsServiceRequest) error {
+	hs := o.httpState.Load()
+	if hs == nil {
+		return fmt.Errorf("HTTP client not initialized")
+	}
+
+	body, err := proto.Marshal(req)
+	if err != nil {
+		// proto.Marshal can fail for requests containing invalid UTF-8 in string
+		// fields (proto3 mandates valid UTF-8). Tested in TestSendHTTP_MarshalRejectsInvalidUTF8.
+		return fmt.Errorf("marshal OTLP request: %w", err)
+	}
+
+	cfg := o.cfg.Load()
+	if cfg.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.Timeout)
+		defer cancel()
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, hs.endpoint, bytes.NewReader(body))
+	if err != nil {
+		// unreachable: hs.endpoint was validated by resolveMetricsURL at Init time;
+		// method is a constant; body is a *bytes.Reader. See Appendix D.
+		return fmt.Errorf("build HTTP request: %w", err)
+	}
+	httpReq.Header = hs.headers.Clone()
+
+	resp, err := hs.client.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("HTTP export failed: %w", err)
+	}
+	// Defers run LIFO: drain runs before close so the connection is reusable.
+	// Drain happens AFTER any deliberate read of the body below — order matters.
+	defer resp.Body.Close()
+	defer io.Copy(io.Discard, resp.Body) //nolint:errcheck
+
+	if resp.StatusCode/100 == 2 {
+		return nil
+	}
+	return fmt.Errorf("HTTP export returned status %d", resp.StatusCode)
 }

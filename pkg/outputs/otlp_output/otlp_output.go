@@ -62,6 +62,7 @@ type otlpOutput struct {
 	cfg       *atomic.Pointer[config]
 	dynCfg    *atomic.Pointer[dynConfig]
 	grpcState *atomic.Pointer[grpcClientState]
+	httpState *atomic.Pointer[httpClientState]
 	eventCh   *atomic.Pointer[chan *formatters.EventMsg]
 
 	logger   *log.Logger
@@ -158,6 +159,7 @@ func (o *otlpOutput) initFields() {
 	o.cfg = new(atomic.Pointer[config])
 	o.dynCfg = new(atomic.Pointer[dynConfig])
 	o.grpcState = new(atomic.Pointer[grpcClientState])
+	o.httpState = new(atomic.Pointer[httpClientState])
 	o.eventCh = new(atomic.Pointer[chan *formatters.EventMsg])
 	o.wg = new(sync.WaitGroup)
 	o.logger = log.New(io.Discard, loggingPrefix, utils.DefaultLoggingFlags)

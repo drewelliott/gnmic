@@ -9,6 +9,7 @@
 package otlp_output
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -30,6 +31,9 @@ import (
 
 	"github.com/openconfig/gnmic/pkg/api/types"
 	"github.com/stretchr/testify/require"
+	metricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
+	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestMTLSHarness_ClientCanReachServer(t *testing.T) {
@@ -347,4 +351,147 @@ func TestInitHTTPFor_EmptyEndpointErrors(t *testing.T) {
 	_, err := o.initHTTPFor(cfg)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "endpoint is required")
+}
+
+func TestSendHTTP_SuccessfulExport(t *testing.T) {
+	var gotBody []byte
+	var gotContentType, gotOrgID string
+
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, http.MethodPost, r.Method)
+		require.Equal(t, otlpHTTPMetricsPath, r.URL.Path)
+		gotContentType = r.Header.Get("Content-Type")
+		gotOrgID = r.Header.Get("X-Scope-OrgID")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	o := &otlpOutput{}
+	o.cfg = new(atomic.Pointer[config])
+	o.httpState = new(atomic.Pointer[httpClientState])
+	o.logger = log.New(io.Discard, "", 0)
+
+	cfg := &config{
+		Endpoint: srv.URL,
+		Protocol: "http",
+		Timeout:  5 * time.Second,
+		TLS: &types.TLSConfig{
+			CaFile:   srv.CAPath(),
+			CertFile: srv.ClientCertPath(),
+			KeyFile:  srv.ClientKeyPath(),
+		},
+		Headers: map[string]string{"X-Scope-OrgID": "tenant-1"},
+	}
+	o.cfg.Store(cfg)
+
+	hs, err := o.initHTTPFor(cfg)
+	require.NoError(t, err)
+	o.httpState.Store(hs)
+
+	// Minimal valid ExportMetricsServiceRequest.
+	req := &metricsv1.ExportMetricsServiceRequest{}
+	require.NoError(t, o.sendHTTP(context.Background(), req))
+
+	require.Equal(t, "application/x-protobuf", gotContentType)
+	require.Equal(t, "tenant-1", gotOrgID)
+
+	// Round-trip check: unmarshal body and compare.
+	var roundtrip metricsv1.ExportMetricsServiceRequest
+	require.NoError(t, proto.Unmarshal(gotBody, &roundtrip))
+}
+
+// newHTTPTestOutput is shared by every test that drives sendHTTP through a real
+// httptest server. Defining it here in Task 5 so subsequent tasks can use it
+// without re-introducing.
+func newHTTPTestOutput(t *testing.T, srv *mTLSTestServer) *otlpOutput {
+	t.Helper()
+	o := &otlpOutput{}
+	o.cfg = new(atomic.Pointer[config])
+	o.httpState = new(atomic.Pointer[httpClientState])
+	o.logger = log.New(io.Discard, "", 0)
+	cfg := &config{
+		Endpoint: srv.URL,
+		Protocol: "http",
+		Timeout:  2 * time.Second,
+		TLS: &types.TLSConfig{
+			CaFile:   srv.CAPath(),
+			CertFile: srv.ClientCertPath(),
+			KeyFile:  srv.ClientKeyPath(),
+		},
+	}
+	o.cfg.Store(cfg)
+	hs, err := o.initHTTPFor(cfg)
+	require.NoError(t, err)
+	o.httpState.Store(hs)
+	return o
+}
+
+// Decision-path: defensive guard for "Init never ran or partially failed".
+func TestSendHTTP_NoStateInitialized(t *testing.T) {
+	o := &otlpOutput{}
+	o.cfg = new(atomic.Pointer[config])
+	o.httpState = new(atomic.Pointer[httpClientState]) // never Stored
+	o.logger = log.New(io.Discard, "", 0)
+	o.cfg.Store(&config{Protocol: "http", Endpoint: "https://x"})
+
+	err := o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "not initialized")
+}
+
+// Decision-path: cfg.Timeout == 0 skips the WithTimeout branch.
+// We start an mTLS server, send normally, and just verify success — exercising
+// the no-timeout path. Hangs would be caught by the test runner's overall timeout.
+func TestSendHTTP_NoTimeoutConfigured(t *testing.T) {
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	o.cfg.Load().Timeout = 0 // explicit override after newHTTPTestOutput's default
+
+	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+}
+
+// Decision-path: client.Do failure (transport error). Stop the server first so
+// the dial fails — this exercises the "HTTP export failed" branch without
+// hitting the response classification code.
+func TestSendHTTP_DialFailure(t *testing.T) {
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {})
+	o := newHTTPTestOutput(t, srv)
+	srv.Close() // close before the call so dial fails
+
+	err := o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{})
+	require.Error(t, err)
+}
+
+// Decision-path: proto.Marshal fails when a string field contains invalid UTF-8
+// (proto3 requires UTF-8). The server handler must NOT be reached because the
+// failure is local to the marshal step.
+func TestSendHTTP_MarshalRejectsInvalidUTF8(t *testing.T) {
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("server must not receive a request when proto.Marshal fails")
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	invalid := string([]byte{0xff, 0xfe, 0xfd}) // not valid UTF-8
+	req := &metricsv1.ExportMetricsServiceRequest{
+		ResourceMetrics: []*metricspb.ResourceMetrics{
+			{
+				ScopeMetrics: []*metricspb.ScopeMetrics{
+					{
+						Metrics: []*metricspb.Metric{
+							{Name: invalid},
+						},
+					},
+				},
+			},
+		},
+	}
+	err := o.sendHTTP(context.Background(), req)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "marshal OTLP request")
 }
