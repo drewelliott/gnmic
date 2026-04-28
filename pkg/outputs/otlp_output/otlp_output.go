@@ -558,6 +558,7 @@ func (o *otlpOutput) sendBatch(ctx context.Context, events []*formatters.EventMs
 	req := o.convertToOTLP(events)
 
 	var err error
+retry:
 	for attempt := 0; attempt <= cfg.MaxRetries; attempt++ {
 		switch cfg.Protocol {
 		case "grpc":
@@ -565,9 +566,14 @@ func (o *otlpOutput) sendBatch(ctx context.Context, events []*formatters.EventMs
 		case "http":
 			err = o.sendHTTP(ctx, req)
 		default:
-			// validateConfig should reject anything else at Init and reload;
-			// surface clearly if it leaks through.
+			// Init's transport switch rejects unsupported protocols at startup,
+			// and Task 8 adds the same guard to validateConfig (so reload is also
+			// covered). This default is the last line of defense — log and abort
+			// immediately rather than spinning MaxRetries on an error that
+			// cannot resolve itself.
+			o.logger.Printf("unsupported protocol %q, aborting batch", cfg.Protocol)
 			err = fmt.Errorf("unsupported protocol %q", cfg.Protocol)
+			break retry
 		}
 
 		if err == nil {
