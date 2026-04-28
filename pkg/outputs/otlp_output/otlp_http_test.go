@@ -217,6 +217,15 @@ func TestResolveMetricsURL(t *testing.T) {
 		// Decision-path: per the OTLP exporter spec, only http and https schemes are valid.
 		{"unsupported_scheme_ftp", "ftp://example.com:4318", false, "", true},
 		{"unsupported_scheme_grpc", "grpc://example.com:4317", false, "", true},
+		// Decision-path: port-only ":4318" must NOT pass — Hostname() check catches it.
+		{"port_only_bare_rejected", ":4318", false, "", true},
+		// Decision-path: bare endpoint must be host:port only; paths require a full URL.
+		{"bare_endpoint_with_path_rejected", "localhost:4318/custom", false, "", true},
+		// Decision-path: userinfo in URL must be rejected — auth goes through Headers config.
+		{"userinfo_rejected", "https://user:pass@host:4318", true, "", true},
+		// Positive: IPv6 bare and full URLs must work end-to-end.
+		{"ipv6_bare_with_brackets", "[::1]:4318", false, "http://[::1]:4318/v1/metrics", false},
+		{"ipv6_full_url", "https://[::1]:4318", true, "https://[::1]:4318/v1/metrics", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -32,8 +32,13 @@ func resolveMetricsURL(endpoint string, tlsEnabled bool) (string, error) {
 		return "", fmt.Errorf("endpoint is required")
 	}
 
-	// If no scheme, synthesize one.
+	// If no scheme, synthesize one. The bare form is strictly host:port — a
+	// path component here is a configuration mistake (e.g. "localhost:4318/foo")
+	// that we reject rather than silently mangle into "/foo/v1/metrics".
 	if !strings.Contains(endpoint, "://") {
+		if strings.ContainsRune(endpoint, '/') {
+			return "", fmt.Errorf("bare endpoint %q must be host:port only; use a full URL if a path is needed", endpoint)
+		}
 		scheme := "http"
 		if tlsEnabled {
 			scheme = "https"
@@ -54,9 +59,18 @@ func resolveMetricsURL(endpoint string, tlsEnabled bool) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported endpoint scheme %q: must be http or https", u.Scheme)
 	}
+	// Reject userinfo in URL — auth must go through the Headers config field
+	// (e.g. "Authorization: Bearer ..."). Userinfo in URLs leaks into logs and
+	// error messages and is not how OTLP backends authenticate clients.
+	if u.User != nil {
+		return "", fmt.Errorf("endpoint must not include userinfo; use the headers config field for authentication")
+	}
 	// url.Parse is lenient — a Host that contains whitespace or control chars
 	// will parse but cannot be used in a real request. Reject explicitly.
-	if u.Host == "" || strings.ContainsAny(u.Host, " \t\r\n") {
+	// Use Hostname() (not Host) so a port-only string like ":4318" — which
+	// has Host==":4318" but no actual hostname — is rejected. This is the
+	// difference between "fails at Init" and "fails on first dial".
+	if u.Hostname() == "" || strings.ContainsAny(u.Host, " \t\r\n") {
 		return "", fmt.Errorf("invalid endpoint host %q", u.Host)
 	}
 	if u.Path == "" || u.Path == "/" {
