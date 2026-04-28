@@ -9,6 +9,7 @@
 package otlp_output
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -31,6 +32,7 @@ import (
 	"time"
 
 	"github.com/openconfig/gnmic/pkg/api/types"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	metricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
@@ -603,4 +605,125 @@ func TestParseRetryAfter_Table(t *testing.T) {
 			require.Less(t, diff, time.Second, "got=%v want=%v", got, tc.want)
 		})
 	}
+}
+
+func TestSendHTTP_PartialSuccessReturnsError(t *testing.T) {
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		// Build a 200 response containing a PartialSuccess with rejected points.
+		respProto := &metricsv1.ExportMetricsServiceResponse{
+			PartialSuccess: &metricsv1.ExportMetricsPartialSuccess{
+				RejectedDataPoints: 7,
+				ErrorMessage:       "schema validation failed for 7 points",
+			},
+		}
+		body, err := proto.Marshal(respProto)
+		require.NoError(t, err)
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	err := o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{})
+	require.Error(t, err, "PartialSuccess with rejected points must surface as an error (parity with gRPC)")
+	require.Contains(t, err.Error(), "rejected 7")
+}
+
+// Decision-path: PartialSuccess present but RejectedDataPoints == 0 must NOT
+// surface as an error. This is the "informational" PartialSuccess case (e.g.
+// server reporting metadata about a fully-accepted batch).
+func TestSendHTTP_PartialSuccessZeroRejected(t *testing.T) {
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		respProto := &metricsv1.ExportMetricsServiceResponse{
+			PartialSuccess: &metricsv1.ExportMetricsPartialSuccess{
+				RejectedDataPoints: 0,
+				ErrorMessage:       "informational",
+			},
+		}
+		body, _ := proto.Marshal(respProto)
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+}
+
+// Decision-path: empty 200 body must succeed (the early-return short-circuit).
+func TestSendHTTP_EmptyResponseBody(t *testing.T) {
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK) // no body written
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+}
+
+// Decision-path (debug off): malformed (non-protobuf) 200 body must NOT cause
+// an error; the transport-level success is authoritative. The Debug branch
+// is silent in this variant.
+func TestSendHTTP_MalformedResponseBody_DebugOff(t *testing.T) {
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("this is definitely not a protobuf"))
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	require.False(t, o.cfg.Load().Debug, "precondition: debug must be off for this variant")
+	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+}
+
+// Decision-path (debug on): same scenario but Debug enabled — exercises the
+// `if cfg.Debug { o.logger.Printf(...) }` branch. Captures log output via a
+// buffer to verify the warning was emitted.
+func TestSendHTTP_MalformedResponseBody_DebugOn(t *testing.T) {
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("not a protobuf"))
+	})
+	defer srv.Close()
+
+	var logbuf bytes.Buffer
+	o := newHTTPTestOutput(t, srv)
+	o.logger = log.New(&logbuf, "", 0)
+	withCfg(o, func(c *config) { c.Debug = true })
+
+	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.Contains(t, logbuf.String(), "failed to unmarshal OTLP response body")
+}
+
+// Decision-path: when EnableMetrics is set, PartialSuccess rejections must
+// increment the otlpRejectedDataPoints counter (parity with gRPC path).
+func TestSendHTTP_PartialSuccessIncrementsMetric(t *testing.T) {
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		respProto := &metricsv1.ExportMetricsServiceResponse{
+			PartialSuccess: &metricsv1.ExportMetricsPartialSuccess{
+				RejectedDataPoints: 3,
+				ErrorMessage:       "rejected 3",
+			},
+		}
+		body, _ := proto.Marshal(respProto)
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	withCfg(o, func(c *config) {
+		c.EnableMetrics = true
+		c.Name = "test-metric-output"
+	})
+
+	cfgName := o.cfg.Load().Name
+	before := testutil.ToFloat64(otlpRejectedDataPoints.WithLabelValues(cfgName))
+	err := o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{})
+	require.Error(t, err)
+	after := testutil.ToFloat64(otlpRejectedDataPoints.WithLabelValues(cfgName))
+	require.Equal(t, float64(3), after-before, "metric must advance by RejectedDataPoints")
 }

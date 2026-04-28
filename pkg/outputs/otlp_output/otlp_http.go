@@ -254,6 +254,31 @@ func (o *otlpOutput) sendHTTP(ctx context.Context, req *metricsv1.ExportMetricsS
 	defer io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode/100 == 2 {
+		// Read up to 64 KiB of the response body to check for PartialSuccess.
+		// OTLP responses are normally small; the cap prevents a misbehaving server
+		// from forcing us to allocate unbounded memory on each export.
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		if len(respBody) == 0 {
+			return nil
+		}
+		var respProto metricsv1.ExportMetricsServiceResponse
+		if err := proto.Unmarshal(respBody, &respProto); err != nil {
+			// Malformed response body but transport-level success — log and accept.
+			if cfg.Debug {
+				o.logger.Printf("DEBUG: failed to unmarshal OTLP response body: %v", err)
+			}
+			return nil
+		}
+		if respProto.PartialSuccess != nil && respProto.PartialSuccess.RejectedDataPoints > 0 {
+			errMsg := fmt.Sprintf("OTEL rejected %d data points: %s",
+				respProto.PartialSuccess.RejectedDataPoints,
+				respProto.PartialSuccess.ErrorMessage)
+			o.logger.Printf("ERROR: %s", errMsg)
+			if cfg.EnableMetrics {
+				otlpRejectedDataPoints.WithLabelValues(cfg.Name).Add(float64(respProto.PartialSuccess.RejectedDataPoints))
+			}
+			return fmt.Errorf("%s", errMsg)
+		}
 		return nil
 	}
 
