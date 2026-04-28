@@ -277,7 +277,7 @@ func (o *otlpOutput) sendHTTP(ctx context.Context, req *metricsv1.ExportMetricsS
 			if cfg.EnableMetrics {
 				otlpRejectedDataPoints.WithLabelValues(cfg.Name).Add(float64(respProto.PartialSuccess.RejectedDataPoints))
 			}
-			return fmt.Errorf("%s", errMsg)
+			return errors.New(errMsg)
 		}
 		return nil
 	}
