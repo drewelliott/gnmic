@@ -247,7 +247,9 @@ func (o *otlpOutput) Init(ctx context.Context, name string, cfg map[string]inter
 		}
 		o.httpState.Store(hs)
 	default:
-		return fmt.Errorf("unsupported protocol '%s': must be 'grpc' or 'http'", ncfg.Protocol)
+		// unreachable: validateConfig (called above) rejects any protocol
+		// outside {grpc, http}. Kept as defensive belt-and-suspenders.
+		return fmt.Errorf("unsupported protocol %q: must be 'grpc' or 'http'", ncfg.Protocol)
 	}
 
 	// Initialize worker channels
