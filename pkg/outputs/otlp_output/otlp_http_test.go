@@ -17,6 +17,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"log"
 	"math/big"
@@ -504,4 +505,102 @@ func TestSendHTTP_MarshalRejectsInvalidUTF8(t *testing.T) {
 	err := o.sendHTTP(context.Background(), req)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "marshal OTLP request")
+}
+
+// Table-driven decision-path coverage for isPermanentHTTPError.
+// Per OTLP spec (https://opentelemetry.io/docs/specs/otlp/), retryable status
+// codes are 429, 502, 503, 504. All other 4xx and 5xx are permanent.
+// Transport-level errors (errors.As fails to find *httpExportError) are
+// treated as retryable — typically transient network blips.
+func TestIsPermanentHTTPError_Table(t *testing.T) {
+	cases := []struct {
+		name      string
+		err       error
+		permanent bool
+	}{
+		// Transport / wrapped non-HTTP errors → retryable.
+		{"transport_error", fmt.Errorf("dial tcp: connection refused"), false},
+		{"nil_error", nil, false}, // nil isn't permanent (caller checks err != nil first)
+
+		// Retryable per OTLP spec.
+		{"status_429_too_many_requests", &httpExportError{status: 429}, false},
+		{"status_502_bad_gateway", &httpExportError{status: 502}, false},
+		{"status_503_service_unavailable", &httpExportError{status: 503}, false},
+		{"status_504_gateway_timeout", &httpExportError{status: 504}, false},
+
+		// Permanent (4xx and 5xx not in retryable set).
+		{"status_400_bad_request", &httpExportError{status: 400}, true},
+		{"status_401_unauthorized", &httpExportError{status: 401}, true},
+		{"status_403_forbidden", &httpExportError{status: 403}, true},
+		{"status_404_not_found", &httpExportError{status: 404}, true},
+		{"status_408_request_timeout_permanent_per_otlp", &httpExportError{status: 408}, true},
+		{"status_500_internal_server_error", &httpExportError{status: 500}, true},
+		{"status_501_not_implemented", &httpExportError{status: 501}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.permanent, isPermanentHTTPError(tc.err))
+		})
+	}
+}
+
+// Sanity check that the integration with a live server matches the table:
+// permanent 400 surfaces as permanent, retryable 503 does not, and sendHTTP
+// itself never retries (the loop is in sendBatch).
+func TestSendHTTP_PermanentErrorNotRetried(t *testing.T) {
+	var calls int
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusBadRequest) // 400
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	err := o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{})
+	require.Error(t, err)
+	require.True(t, isPermanentHTTPError(err))
+	require.Equal(t, 1, calls, "sendHTTP itself should not retry")
+}
+
+func TestSendHTTP_RetryableError(t *testing.T) {
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable) // 503
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	err := o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{})
+	require.Error(t, err)
+	require.False(t, isPermanentHTTPError(err))
+}
+
+// Table-driven decision-path coverage for parseRetryAfter (RFC 7231 §7.1.3).
+func TestParseRetryAfter_Table(t *testing.T) {
+	now := time.Date(2026, 4, 27, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		in   string
+		want time.Duration
+	}{
+		{"empty", "", 0},
+		{"whitespace_only", "   ", 0},
+		{"zero_seconds", "0", 0},
+		{"five_seconds", "5", 5 * time.Second},
+		{"surrounded_by_whitespace", "  5  ", 5 * time.Second},
+		{"negative_seconds_clamped_to_zero", "-1", 0},
+		{"unparseable", "not-a-number", 0},
+		{"http_date_in_future", now.Add(10 * time.Second).UTC().Format(http.TimeFormat), 10 * time.Second},
+		{"http_date_in_past", now.Add(-time.Hour).UTC().Format(http.TimeFormat), 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseRetryAfter(tc.in, now)
+			// HTTP-date precision is seconds; allow a tiny tolerance to absorb formatting jitter.
+			diff := got - tc.want
+			if diff < 0 {
+				diff = -diff
+			}
+			require.Less(t, diff, time.Second, "got=%v want=%v", got, tc.want)
+		})
+	}
 }

@@ -12,11 +12,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +27,63 @@ import (
 )
 
 const otlpHTTPMetricsPath = "/v1/metrics"
+
+// httpExportError carries the HTTP status code alongside the underlying error,
+// so the caller can distinguish retryable (429/5xx) from permanent (4xx) failures.
+type httpExportError struct {
+	status     int
+	retryAfter time.Duration // populated from Retry-After header if present; 0 otherwise
+	msg        string
+}
+
+func (e *httpExportError) Error() string {
+	return fmt.Sprintf("HTTP export returned status %d: %s", e.status, e.msg)
+}
+
+// isPermanentHTTPError returns true when the error should NOT be retried.
+// Per OTLP spec (https://opentelemetry.io/docs/specs/otlp/), retryable status
+// codes are 429 Too Many Requests, 502 Bad Gateway, 503 Service Unavailable,
+// and 504 Gateway Timeout. All other 4xx and 5xx are permanent.
+// Transport-level errors (no *httpExportError) are retryable — typically
+// transient network blips.
+func isPermanentHTTPError(err error) bool {
+	var hee *httpExportError
+	if !errors.As(err, &hee) {
+		return false
+	}
+	switch hee.status {
+	case http.StatusTooManyRequests,    // 429
+		http.StatusBadGateway,          // 502
+		http.StatusServiceUnavailable,  // 503
+		http.StatusGatewayTimeout:      // 504
+		return false
+	default:
+		return true
+	}
+}
+
+// parseRetryAfter interprets the Retry-After header per RFC 7231 §7.1.3.
+// It accepts either a delta-seconds integer or an HTTP-date.
+// Returns 0 when the header is absent, empty, or unparseable.
+func parseRetryAfter(h string, now time.Time) time.Duration {
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return 0
+	}
+	// Delta-seconds form.
+	if secs, err := strconv.Atoi(h); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	// HTTP-date form.
+	if t, err := http.ParseTime(h); err == nil {
+		d := t.Sub(now)
+		if d < 0 {
+			return 0
+		}
+		return d
+	}
+	return 0
+}
 
 // resolveMetricsURL normalizes a user-supplied endpoint into the absolute URL
 // that sendHTTP will POST to. It accepts either a bare "host:port"
@@ -197,5 +256,13 @@ func (o *otlpOutput) sendHTTP(ctx context.Context, req *metricsv1.ExportMetricsS
 	if resp.StatusCode/100 == 2 {
 		return nil
 	}
-	return fmt.Errorf("HTTP export returned status %d", resp.StatusCode)
+
+	// Best-effort read of a small response body to include in the error message.
+	bodySnippet := make([]byte, 256)
+	n, _ := io.ReadFull(resp.Body, bodySnippet)
+	return &httpExportError{
+		status:     resp.StatusCode,
+		retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
+		msg:        string(bodySnippet[:n]),
+	}
 }
