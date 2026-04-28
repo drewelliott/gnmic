@@ -9,9 +9,13 @@
 package otlp_output
 
 import (
+	"crypto/tls"
 	"fmt"
+	"net"
+	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 const otlpHTTPMetricsPath = "/v1/metrics"
@@ -77,4 +81,66 @@ func resolveMetricsURL(endpoint string, tlsEnabled bool) (string, error) {
 		u.Path = otlpHTTPMetricsPath
 	}
 	return u.String(), nil
+}
+
+// httpClientState is the transport-specific state for protocol: http.
+// Stored in an atomic.Pointer on otlpOutput so it can be swapped atomically
+// during live config reload.
+type httpClientState struct {
+	client   *http.Client
+	endpoint string
+	headers  http.Header
+}
+
+func (o *otlpOutput) initHTTPFor(cfg *config) (*httpClientState, error) {
+	// Strict-coherence guard (ratified Decision 1): an explicit http:// scheme
+	// combined with a configured tls block is almost always a misconfiguration
+	// that silently disables mTLS. Reject early with a clear message rather than
+	// letting the operator discover this only via packet capture in production.
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+	if cfg.TLS != nil && strings.HasPrefix(strings.ToLower(endpoint), "http://") {
+		return nil, fmt.Errorf("endpoint scheme is http:// but tls block is configured; use https:// (or a bare host:port) or remove the tls block")
+	}
+
+	var tlsConfig *tls.Config
+	if cfg.TLS != nil {
+		var err error
+		tlsConfig, err = o.createTLSConfigFor(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create TLS config: %w", err)
+		}
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig:       tlsConfig,
+		MaxIdleConns:          10,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       90 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		// No client-side Timeout: per-request context timeout is the authoritative deadline,
+		// matching the gRPC path (which uses context.WithTimeout in sendGRPC).
+	}
+
+	endpoint, err := resolveMetricsURL(cfg.Endpoint, cfg.TLS != nil)
+	if err != nil {
+		return nil, err
+	}
+
+	hdr := http.Header{}
+	for k, v := range cfg.Headers {
+		hdr.Set(k, v)
+	}
+	hdr.Set("Content-Type", "application/x-protobuf")
+	// Compression header is set per-request in sendHTTP if compression is enabled.
+
+	o.logger.Printf("initialized OTLP HTTP client for endpoint: %s", endpoint)
+	return &httpClientState{client: client, endpoint: endpoint, headers: hdr}, nil
 }

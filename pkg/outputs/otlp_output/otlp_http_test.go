@@ -24,9 +24,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/openconfig/gnmic/pkg/api/types"
 	"github.com/stretchr/testify/require"
 )
 
@@ -238,4 +240,111 @@ func TestResolveMetricsURL(t *testing.T) {
 			require.Equal(t, tc.want, got)
 		})
 	}
+}
+
+func TestInitHTTPFor_WithMTLS(t *testing.T) {
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	o := &otlpOutput{}
+	o.cfg = new(atomic.Pointer[config])
+	o.logger = log.New(io.Discard, "", 0)
+	cfg := &config{
+		Endpoint: srv.URL, // full https URL from httptest
+		Protocol: "http",
+		TLS: &types.TLSConfig{
+			CaFile:   srv.CAPath(),
+			CertFile: srv.ClientCertPath(),
+			KeyFile:  srv.ClientKeyPath(),
+		},
+		Headers: map[string]string{"X-Scope-OrgID": "tenant-1"},
+	}
+	o.cfg.Store(cfg)
+
+	hs, err := o.initHTTPFor(cfg)
+	require.NoError(t, err)
+	require.NotNil(t, hs)
+	require.NotNil(t, hs.client)
+	require.Contains(t, hs.endpoint, "/v1/metrics")
+	require.Equal(t, "application/x-protobuf", hs.headers.Get("Content-Type"))
+	require.Equal(t, "tenant-1", hs.headers.Get("X-Scope-OrgID"))
+}
+
+func TestInitHTTPFor_NoTLSBlock(t *testing.T) {
+	o := &otlpOutput{}
+	o.cfg = new(atomic.Pointer[config])
+	o.logger = log.New(io.Discard, "", 0)
+	cfg := &config{Endpoint: "localhost:4318", Protocol: "http"}
+	o.cfg.Store(cfg)
+
+	hs, err := o.initHTTPFor(cfg)
+	require.NoError(t, err)
+	require.Equal(t, "http://localhost:4318/v1/metrics", hs.endpoint)
+}
+
+// Strict-coherence guard: configuring TLS while pinning a plaintext URL is
+// almost always a misconfiguration that silently disables mTLS. Reject at Init.
+func TestInitHTTPFor_PlaintextURLWithTLSBlockErrors(t *testing.T) {
+	o := &otlpOutput{}
+	o.cfg = new(atomic.Pointer[config])
+	o.logger = log.New(io.Discard, "", 0)
+	cfg := &config{
+		Endpoint: "http://panoptes.observability.svc:4318",
+		Protocol: "http",
+		TLS:      &types.TLSConfig{CaFile: "/some/ca.crt"},
+	}
+	o.cfg.Store(cfg)
+
+	_, err := o.initHTTPFor(cfg)
+	require.Error(t, err, "must reject http:// URL when tls block is configured")
+	require.Contains(t, err.Error(), "tls")
+}
+
+// Mirror case stays permissive: https:// URL with no tls block uses system roots.
+func TestInitHTTPFor_HTTPSURLWithoutTLSBlockAllowed(t *testing.T) {
+	o := &otlpOutput{}
+	o.cfg = new(atomic.Pointer[config])
+	o.logger = log.New(io.Discard, "", 0)
+	cfg := &config{Endpoint: "https://panoptes.example.com/v1/metrics", Protocol: "http"}
+	o.cfg.Store(cfg)
+
+	hs, err := o.initHTTPFor(cfg)
+	require.NoError(t, err)
+	require.Equal(t, "https://panoptes.example.com/v1/metrics", hs.endpoint)
+}
+
+// Decision-path: createTLSConfigFor failure must propagate as a clear Init error.
+func TestInitHTTPFor_TLSCreateFails(t *testing.T) {
+	o := &otlpOutput{}
+	o.cfg = new(atomic.Pointer[config])
+	o.logger = log.New(io.Discard, "", 0)
+	cfg := &config{
+		Endpoint: "https://panoptes.example.com:4318",
+		Protocol: "http",
+		TLS: &types.TLSConfig{
+			CaFile:   "/nonexistent/path/ca.crt",
+			CertFile: "/nonexistent/path/client.crt",
+			KeyFile:  "/nonexistent/path/client.key",
+		},
+	}
+	o.cfg.Store(cfg)
+
+	_, err := o.initHTTPFor(cfg)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "TLS")
+}
+
+// Decision-path: empty endpoint reaching resolveMetricsURL must surface as Init error.
+func TestInitHTTPFor_EmptyEndpointErrors(t *testing.T) {
+	o := &otlpOutput{}
+	o.cfg = new(atomic.Pointer[config])
+	o.logger = log.New(io.Discard, "", 0)
+	cfg := &config{Endpoint: "", Protocol: "http"}
+	o.cfg.Store(cfg)
+
+	_, err := o.initHTTPFor(cfg)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "endpoint is required")
 }
