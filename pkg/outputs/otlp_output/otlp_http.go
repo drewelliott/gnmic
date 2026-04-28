@@ -192,7 +192,7 @@ func (o *otlpOutput) sendHTTP(ctx context.Context, req *metricsv1.ExportMetricsS
 	// Defers run LIFO: drain runs before close so the connection is reusable.
 	// Drain happens AFTER any deliberate read of the body below — order matters.
 	defer resp.Body.Close()
-	defer io.Copy(io.Discard, resp.Body) //nolint:errcheck
+	defer io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode/100 == 2 {
 		return nil

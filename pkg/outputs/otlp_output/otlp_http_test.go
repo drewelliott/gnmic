@@ -401,6 +401,16 @@ func TestSendHTTP_SuccessfulExport(t *testing.T) {
 	require.NoError(t, proto.Unmarshal(gotBody, &roundtrip))
 }
 
+// withCfg applies a mutation to a copy of the current config and atomically
+// swaps it back. Test-only convenience — production reloads via Update().
+// Direct mutation of o.cfg.Load() (e.g. `o.cfg.Load().Timeout = 0`) is an
+// unsynchronized write that defeats atomic.Pointer; this helper does it safely.
+func withCfg(o *otlpOutput, mutate func(*config)) {
+	cfg := *o.cfg.Load()
+	mutate(&cfg)
+	o.cfg.Store(&cfg)
+}
+
 // newHTTPTestOutput is shared by every test that drives sendHTTP through a real
 // httptest server. Defining it here in Task 5 so subsequent tasks can use it
 // without re-introducing.
@@ -450,7 +460,7 @@ func TestSendHTTP_NoTimeoutConfigured(t *testing.T) {
 	defer srv.Close()
 
 	o := newHTTPTestOutput(t, srv)
-	o.cfg.Load().Timeout = 0 // explicit override after newHTTPTestOutput's default
+	withCfg(o, func(c *config) { c.Timeout = 0 })
 
 	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
 }
