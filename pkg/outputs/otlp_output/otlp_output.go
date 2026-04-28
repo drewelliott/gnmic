@@ -205,6 +205,9 @@ func (o *otlpOutput) Init(ctx context.Context, name string, cfg map[string]inter
 		ncfg.Name = options.Name
 	}
 	o.setDefaultsFor(ncfg)
+	if err := o.validateConfig(ncfg); err != nil {
+		return err
+	}
 
 	// Apply logger
 	if options.Logger != nil {
@@ -238,7 +241,11 @@ func (o *otlpOutput) Init(ctx context.Context, name string, cfg map[string]inter
 		}
 		o.grpcState.Store(gs)
 	case "http":
-		return fmt.Errorf("HTTP transport not yet implemented")
+		hs, err := o.initHTTPFor(ncfg)
+		if err != nil {
+			return fmt.Errorf("failed to initialize HTTP transport: %w", err)
+		}
+		o.httpState.Store(hs)
 	default:
 		return fmt.Errorf("unsupported protocol '%s': must be 'grpc' or 'http'", ncfg.Protocol)
 	}
@@ -278,7 +285,7 @@ func (o *otlpOutput) Update(ctx context.Context, cfg map[string]any) error {
 
 	swapChannel := channelNeedsSwap(currCfg, newCfg)
 	restartWorkers := needsWorkerRestart(currCfg, newCfg)
-	rebuildGRPC := needsGRPCRebuild(currCfg, newCfg)
+	rebuildTransport := needsTransportRebuild(currCfg, newCfg)
 	rebuildProcessors := slices.Compare(currCfg.EventProcessors, newCfg.EventProcessors) != 0
 
 	dc := new(dynConfig)
@@ -293,14 +300,37 @@ func (o *otlpOutput) Update(ctx context.Context, cfg map[string]any) error {
 	}
 	o.dynCfg.Store(dc)
 
-	if rebuildGRPC {
-		gs, err := o.initGRPCFor(newCfg)
-		if err != nil {
-			return fmt.Errorf("failed to rebuild gRPC transport: %w", err)
-		}
-		oldState := o.grpcState.Swap(gs)
-		if oldState != nil && oldState.conn != nil {
-			oldState.conn.Close()
+	if rebuildTransport {
+		switch newCfg.Protocol {
+		case "grpc":
+			gs, err := o.initGRPCFor(newCfg)
+			if err != nil {
+				return fmt.Errorf("failed to rebuild gRPC transport: %w", err)
+			}
+			oldState := o.grpcState.Swap(gs)
+			if oldState != nil && oldState.conn != nil {
+				oldState.conn.Close()
+			}
+			// If we switched transports, tear down the old HTTP client too.
+			if oldHS := o.httpState.Swap(nil); oldHS != nil && oldHS.client != nil {
+				oldHS.client.CloseIdleConnections()
+			}
+		case "http":
+			hs, err := o.initHTTPFor(newCfg)
+			if err != nil {
+				return fmt.Errorf("failed to rebuild HTTP transport: %w", err)
+			}
+			oldState := o.httpState.Swap(hs)
+			if oldState != nil && oldState.client != nil {
+				oldState.client.CloseIdleConnections()
+			}
+			if oldGS := o.grpcState.Swap(nil); oldGS != nil && oldGS.conn != nil {
+				oldGS.conn.Close()
+			}
+		default:
+			// unreachable: validateConfig (called by Update before this switch)
+			// rejects any protocol outside {grpc, http}. See Appendix D.
+			return fmt.Errorf("unsupported protocol %q during reload", newCfg.Protocol)
 		}
 	}
 
@@ -643,6 +673,12 @@ func (o *otlpOutput) setDefaultsFor(c *config) {
 }
 
 func (o *otlpOutput) validateConfig(c *config) error {
+	switch c.Protocol {
+	case "grpc", "http":
+		// ok — setDefaultsFor populates "" → "grpc" before we get here
+	default:
+		return fmt.Errorf("unsupported protocol %q: must be 'grpc' or 'http'", c.Protocol)
+	}
 	if c.Endpoint == "" {
 		return fmt.Errorf("endpoint is required")
 	}
@@ -753,7 +789,7 @@ func needsWorkerRestart(old, nw *config) bool {
 		old.Interval != nw.Interval
 }
 
-func needsGRPCRebuild(old, nw *config) bool {
+func needsTransportRebuild(old, nw *config) bool {
 	if old == nil || nw == nil {
 		return true
 	}

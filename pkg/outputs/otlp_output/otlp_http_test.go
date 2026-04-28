@@ -33,8 +33,11 @@ import (
 
 	"github.com/openconfig/gnmic/pkg/api/types"
 	"github.com/openconfig/gnmic/pkg/formatters"
+	"github.com/openconfig/gnmic/pkg/outputs"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	"github.com/zestor-dev/zestor/store"
+	"github.com/zestor-dev/zestor/store/gomap"
 	metricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	"google.golang.org/protobuf/proto"
@@ -857,4 +860,99 @@ func TestSendBatch_ContextCancelledDuringRetryWait(t *testing.T) {
 
 	// Cancellation should land well before the 5-second Retry-After elapses.
 	require.Less(t, elapsed, 2*time.Second, "ctx cancel must interrupt the retry sleep")
+}
+
+func TestOTLP_InitHTTPTransport_Succeeds(t *testing.T) {
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	o := &otlpOutput{}
+	cfgMap := map[string]interface{}{
+		"type":     "otlp",
+		"endpoint": srv.URL,
+		"protocol": "http",
+		"tls": map[string]interface{}{
+			"ca-file":   srv.CAPath(),
+			"cert-file": srv.ClientCertPath(),
+			"key-file":  srv.ClientKeyPath(),
+		},
+	}
+	err := o.Init(context.Background(), "test-otlp", cfgMap,
+		outputs.WithLogger(log.New(io.Discard, "", 0)),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	)
+	require.NoError(t, err, "Init with protocol: http must succeed once initHTTPFor is wired")
+	defer o.Close()
+}
+
+// Verifies that Init calls validateConfig. We deliberately pick a failure
+// mode that ONLY validateConfig surfaces — counter-pattern compilation —
+// so this test can't pass via the existing Init transport switch or any
+// other accidental gate. If an implementer forgets the validateConfig call
+// in Init, this test fails: the bad pattern would otherwise be accepted at
+// startup and silently produce a runtime issue later.
+func TestOTLP_InitRunsValidateConfig(t *testing.T) {
+	o := &otlpOutput{}
+	cfg := map[string]interface{}{
+		"endpoint":         "localhost:4317",
+		"protocol":         "grpc",             // valid — passes every other Init gate
+		"counter-patterns": []interface{}{"("}, // unclosed paren; only validateConfig compiles regexes
+	}
+	err := o.Init(context.Background(), "test-otlp", cfg,
+		outputs.WithLogger(log.New(io.Discard, "", 0)),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid counter-pattern")
+}
+
+// Decision-path: validateConfig must reject protocols outside the allowed set.
+func TestValidateConfig_RejectsBadProtocol(t *testing.T) {
+	o := &otlpOutput{}
+	cfg := &config{
+		Endpoint: "localhost:4317",
+		Protocol: "tcp", // not grpc/http
+	}
+	o.setDefaultsFor(cfg) // run defaults first so other fields are sane
+	cfg.Protocol = "tcp"  // re-apply after setDefaultsFor (which would replace "" with "grpc")
+	err := o.validateConfig(cfg)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unsupported protocol")
+}
+
+// Table-driven decision-path coverage for needsTransportRebuild.
+// (Compression-diff case is added in Task 10 once the field exists.)
+func TestNeedsTransportRebuild_Table(t *testing.T) {
+	base := func() *config {
+		return &config{
+			Endpoint: "localhost:4318",
+			Protocol: "http",
+			TLS:      &types.TLSConfig{CaFile: "/ca"},
+		}
+	}
+	withTLS := func(c *config, ca string) *config { c.TLS = &types.TLSConfig{CaFile: ca}; return c }
+
+	cases := []struct {
+		name string
+		old  *config
+		nw   *config
+		want bool
+	}{
+		{"both_nil", nil, nil, true},
+		{"old_nil", nil, base(), true},
+		{"new_nil", base(), nil, true},
+		{"endpoint_changed", base(), func() *config { c := base(); c.Endpoint = "other:4318"; return c }(), true},
+		{"protocol_changed", base(), func() *config { c := base(); c.Protocol = "grpc"; return c }(), true},
+		{"tls_ca_changed", base(), withTLS(base(), "/different-ca"), true},
+		{"tls_added", func() *config { c := base(); c.TLS = nil; return c }(), base(), true},
+		{"tls_removed", base(), func() *config { c := base(); c.TLS = nil; return c }(), true},
+		{"identical_no_rebuild", base(), base(), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, needsTransportRebuild(tc.old, tc.nw))
+		})
+	}
 }
