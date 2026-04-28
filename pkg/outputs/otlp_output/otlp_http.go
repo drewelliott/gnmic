@@ -52,10 +52,10 @@ func isPermanentHTTPError(err error) bool {
 		return false
 	}
 	switch hee.status {
-	case http.StatusTooManyRequests,    // 429
-		http.StatusBadGateway,          // 502
-		http.StatusServiceUnavailable,  // 503
-		http.StatusGatewayTimeout:      // 504
+	case http.StatusTooManyRequests, // 429
+		http.StatusBadGateway,         // 502
+		http.StatusServiceUnavailable, // 503
+		http.StatusGatewayTimeout:     // 504
 		return false
 	default:
 		return true
