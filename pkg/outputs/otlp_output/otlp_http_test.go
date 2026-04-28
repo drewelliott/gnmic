@@ -16,6 +16,8 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
+	"log"
 	"math/big"
 	"net"
 	"net/http"
@@ -88,6 +90,10 @@ func newMTLSTestServer(t *testing.T, handler http.HandlerFunc) *mTLSTestServer {
 		ClientCAs:    caPool,
 		MinVersion:   tls.VersionTLS12,
 	}
+	// Suppress expected TLS-handshake-rejection noise on stderr during tests
+	// like TestMTLSHarness_ClientWithoutCertIsRejected. Future tests reusing
+	// this harness benefit automatically.
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
 	srv.StartTLS()
 
 	dir := t.TempDir()
@@ -156,7 +162,10 @@ func mustGenLeaf(t *testing.T, ca *x509.Certificate, caKey *ecdsa.PrivateKey, cn
 		Subject:      pkix.Name{CommonName: cn},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		// ECDSA keys: KeyUsageDigitalSignature only. KeyUsageKeyEncipherment
+		// is RSA-specific (RFC 5246) and meaningless for EC keys; the Go stdlib
+		// generate_cert.go documents this explicitly.
+		KeyUsage: x509.KeyUsageDigitalSignature,
 	}
 	if isServer {
 		tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
