@@ -191,3 +191,42 @@ func pemKey(k *ecdsa.PrivateKey) []byte {
 	der, _ := x509.MarshalECPrivateKey(k)
 	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der})
 }
+
+func TestResolveMetricsURL(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+		tls      bool
+		want     string
+		wantErr  bool
+	}{
+		{"bare_host_port_tls", "panoptes.example.com:4318", true, "https://panoptes.example.com:4318/v1/metrics", false},
+		{"bare_host_port_plain", "localhost:4318", false, "http://localhost:4318/v1/metrics", false},
+		{"full_https_url_with_path", "https://panoptes.example.com/api/v1/metrics", true, "https://panoptes.example.com/api/v1/metrics", false},
+		{"full_http_url_no_path", "http://localhost:4318", false, "http://localhost:4318/v1/metrics", false},
+		{"full_https_url_no_path_appends_default", "https://panoptes.example.com:4318", true, "https://panoptes.example.com:4318/v1/metrics", false},
+		{"full_url_with_root_slash_path", "https://panoptes.example.com/", true, "https://panoptes.example.com/v1/metrics", false},
+		{"empty_endpoint", "", false, "", true},
+		{"url_with_whitespace", " https://x.com ", true, "https://x.com/v1/metrics", false},
+		// Decision-path: explicit URL with malformed structure must reach url.Parse failure.
+		{"malformed_full_url", "http://[::1", false, "", true},
+		// Decision-path: synthesized bare endpoints must also be validated, otherwise garbage
+		// like "foo bar:4318" survives Init and only fails much later inside http.NewRequestWithContext.
+		{"bare_endpoint_with_space_rejected", "foo bar:4318", false, "", true},
+		{"bare_endpoint_with_control_char_rejected", "foo\nbar:4318", false, "", true},
+		// Decision-path: per the OTLP exporter spec, only http and https schemes are valid.
+		{"unsupported_scheme_ftp", "ftp://example.com:4318", false, "", true},
+		{"unsupported_scheme_grpc", "grpc://example.com:4317", false, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveMetricsURL(tc.endpoint, tc.tls)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+		})
+	}
+}
