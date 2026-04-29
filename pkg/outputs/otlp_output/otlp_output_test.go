@@ -9,10 +9,13 @@
 package otlp_output
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"regexp"
 	"sync"
 	"sync/atomic"
@@ -24,6 +27,7 @@ import (
 	metricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/openconfig/gnmic/pkg/formatters"
 	"github.com/openconfig/gnmic/pkg/outputs"
@@ -918,11 +922,86 @@ func extractAttributesMap(attrs []*commonpb.KeyValue) map[string]string {
 }
 
 // TestOTLP_HTTPTransport_EndToEnd verifies that configuring protocol: http
-// results in a working mTLS-authenticated POST to /v1/metrics.
-// This is the north-star test — it stays failing (skipped) until all tasks complete.
+// results in a working mTLS-authenticated POST to /v1/metrics carrying a
+// valid ExportMetricsServiceRequest built from a real gnmi Event.
+//
+// Default-on gzip is exercised: the body arrives Content-Encoding: gzip and
+// the test decompresses before unmarshal — same path real receivers use.
 func TestOTLP_HTTPTransport_EndToEnd(t *testing.T) {
-	// Spin up an mTLS httptest server that requires client cert,
-	// decodes the protobuf body, and returns 200 on /v1/metrics.
-	// (Helpers created in Task 2 + 3.)
-	t.Skip("north-star: un-skip after Task 12")
+	var (
+		mu          sync.Mutex
+		gotBody     []byte
+		gotEncoding string
+	)
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/v1/metrics", r.URL.Path)
+		require.Equal(t, "application/x-protobuf", r.Header.Get("Content-Type"))
+		mu.Lock()
+		defer mu.Unlock()
+		gotEncoding = r.Header.Get("Content-Encoding")
+		b, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		gotBody = b
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	o := &otlpOutput{}
+	cfgMap := map[string]interface{}{
+		"type":       "otlp",
+		"endpoint":   srv.URL,
+		"protocol":   "http",
+		"batch-size": 1,
+		"interval":   "50ms",
+		"timeout":    "2s",
+		"tls": map[string]interface{}{
+			"ca-file":   srv.CAPath(),
+			"cert-file": srv.ClientCertPath(),
+			"key-file":  srv.ClientKeyPath(),
+		},
+	}
+	require.NoError(t, o.Init(context.Background(), "test-otlp", cfgMap,
+		outputs.WithLogger(log.New(io.Discard, "", 0)),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	))
+	defer o.Close()
+
+	event := &formatters.EventMsg{
+		Name:      "interfaces_interface_state_counters_in_octets",
+		Timestamp: time.Now().UnixNano(),
+		Tags:      map[string]string{"interface_name": "Ethernet1", "source": "10.1.1.1:6030"},
+		Values:    map[string]interface{}{"value": int64(1234567890)},
+	}
+	// WriteEvent (not Write) — Write takes proto.Message and handles SubscribeResponse;
+	// EventMsg is the input form for the batching pipeline.
+	o.WriteEvent(context.Background(), event)
+
+	// Poll up to 2 seconds for the body to arrive.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		got := gotBody != nil
+		mu.Unlock()
+		if got {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	mu.Lock()
+	body := gotBody
+	encoding := gotEncoding
+	mu.Unlock()
+	require.NotNil(t, body, "server did not receive a request within deadline")
+
+	// Default compression for protocol:http is gzip — decompress before unmarshal.
+	if encoding == "gzip" {
+		gr, err := gzip.NewReader(bytes.NewReader(body))
+		require.NoError(t, err)
+		body, err = io.ReadAll(gr)
+		require.NoError(t, err)
+	}
+
+	var req metricsv1.ExportMetricsServiceRequest
+	require.NoError(t, proto.Unmarshal(body, &req))
+	require.NotEmpty(t, req.ResourceMetrics, "ResourceMetrics must be populated")
 }
