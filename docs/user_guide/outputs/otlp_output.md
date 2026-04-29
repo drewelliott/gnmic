@@ -13,7 +13,7 @@ outputs:
     type: otlp
     # required, address of the OTLP collector
     endpoint: localhost:4317
-    # string, transport protocol. Only "grpc" is supported.
+    # string, transport protocol. One of "grpc" or "http".
     # defaults to "grpc"
     protocol: grpc
     # duration, defaults to 10s.
@@ -44,6 +44,11 @@ outputs:
     # integer, defaults to 3.
     # number of retries per export request on failure.
     max-retries: 3
+    # string, request body compression. Only honored when protocol is "http"
+    # (the gRPC path ignores this field).
+    # One of "none" or "gzip". Defaults to "gzip" when protocol is "http".
+    # Set to "none" to disable compression.
+    compression: gzip
     # string, to be used as the metric namespace
     metric-prefix: ""
     # boolean, if true the subscription name will be prepended to the metric name after the prefix.
@@ -190,3 +195,56 @@ When `enable-metrics` is set to `true`, the OTLP output exposes the following Pr
 | `gnmic_otlp_output_number_of_failed_events_total` | Counter | Number of events that failed to send |
 | `gnmic_otlp_output_send_duration_seconds` | Histogram | Duration of sending batches to the OTLP collector |
 | `gnmic_otlp_output_rejected_data_points_total` | Counter | Number of data points rejected by the collector (PartialSuccess) |
+
+## Example: OTLP/HTTP with mTLS
+
+For backends that expose only OTLP/HTTP (such as NVIDIA Panoptes), set `protocol: http` and provide client certificates in the `tls` block.
+
+The `endpoint:` field accepts either a bare `host:port` or a full URL. With a bare value, the scheme is inferred from the presence of the `tls:` block (`https` if present, `http` otherwise) and the path defaults to `/v1/metrics`. With a full URL, scheme and path are honored verbatim — but mixing `http://` with a populated `tls:` block is rejected at startup, since that combination silently disables mTLS.
+
+### External endpoint (public DNS)
+
+```yaml
+outputs:
+  panoptes-external:
+    type: otlp
+    endpoint: panoptes.example.com:4318
+    protocol: http
+    timeout: 10s
+    tls:
+      ca-file:   /etc/pki/panoptes/ca.crt
+      cert-file: /etc/pki/gnmic/client.crt
+      key-file:  /etc/pki/gnmic/client.key
+    compression: gzip
+    batch-size: 1000
+    interval: 5s
+    headers:
+      X-Scope-OrgID: your-tenant-id
+```
+
+### Intra-cluster endpoint (Kubernetes service)
+
+When gnmic runs as a pod in the same Kubernetes cluster as the OTLP backend, the K8s service DNS name is dialed directly — no ingress hop required. The `tls:` block is still used to validate the in-cluster server certificate (typically issued by cert-manager from the cluster CA).
+
+```yaml
+outputs:
+  panoptes-incluster:
+    type: otlp
+    # Resolves via CoreDNS to the panoptes Service ClusterIP.
+    # Short forms also work: `panoptes:4318` (same namespace) or
+    # `panoptes.observability:4318` (cross-namespace).
+    endpoint: panoptes.observability.svc.cluster.local:4318
+    protocol: http
+    timeout: 10s
+    tls:
+      # CA bundle that signed the panoptes Service cert
+      # (often mounted from a cert-manager-managed Secret).
+      ca-file:   /var/run/secrets/panoptes/ca.crt
+      # Client cert+key for gnmic's identity (rotated by cert-manager
+      # via csi-driver-spiffe or a similar workload-identity flow).
+      cert-file: /var/run/secrets/gnmic/tls.crt
+      key-file:  /var/run/secrets/gnmic/tls.key
+    compression: gzip
+    batch-size: 1000
+    interval: 5s
+```
