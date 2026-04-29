@@ -10,6 +10,7 @@ package otlp_output
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -1002,4 +1003,118 @@ func TestOTLP_Close_AfterInitFieldsButBeforeTransportStored(t *testing.T) {
 	o.logger = log.New(io.Discard, "", 0)
 
 	require.NoError(t, o.Close())
+}
+
+func TestSendHTTP_GzipCompression(t *testing.T) {
+	var gotEncoding string
+	var gotBody []byte
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotEncoding = r.Header.Get("Content-Encoding")
+		gr, err := gzip.NewReader(r.Body)
+		require.NoError(t, err)
+		gotBody, _ = io.ReadAll(gr)
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	withCfg(o, func(c *config) { c.Compression = "gzip" })
+	hs, err := o.initHTTPFor(o.cfg.Load())
+	require.NoError(t, err)
+	o.httpState.Store(hs)
+
+	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.Equal(t, "gzip", gotEncoding)
+
+	var roundtrip metricsv1.ExportMetricsServiceRequest
+	require.NoError(t, proto.Unmarshal(gotBody, &roundtrip))
+}
+
+// Default-on verification: a config with protocol:http and no compression set
+// should end up with Compression=="gzip" after setDefaultsFor runs, and the
+// resulting send should carry Content-Encoding: gzip.
+func TestSendHTTP_GzipIsDefaultForHTTP(t *testing.T) {
+	var gotEncoding string
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotEncoding = r.Header.Get("Content-Encoding")
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	o := &otlpOutput{}
+	cfgMap := map[string]interface{}{
+		"type":     "otlp",
+		"endpoint": srv.URL,
+		"protocol": "http",
+		// compression intentionally omitted — default should kick in
+		"tls": map[string]interface{}{
+			"ca-file":   srv.CAPath(),
+			"cert-file": srv.ClientCertPath(),
+			"key-file":  srv.ClientKeyPath(),
+		},
+	}
+	require.NoError(t, o.Init(context.Background(), "test-otlp", cfgMap,
+		outputs.WithLogger(log.New(io.Discard, "", 0)),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	))
+	defer o.Close()
+
+	require.Equal(t, "gzip", o.cfg.Load().Compression, "default must populate Compression for http")
+	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.Equal(t, "gzip", gotEncoding)
+}
+
+// Opt-out verification: explicit "none" disables gzip even when protocol is http.
+func TestSendHTTP_CompressionNoneOptOut(t *testing.T) {
+	var gotEncoding string
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotEncoding = r.Header.Get("Content-Encoding")
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	o := &otlpOutput{}
+	cfgMap := map[string]interface{}{
+		"type":        "otlp",
+		"endpoint":    srv.URL,
+		"protocol":    "http",
+		"compression": "none",
+		"tls": map[string]interface{}{
+			"ca-file":   srv.CAPath(),
+			"cert-file": srv.ClientCertPath(),
+			"key-file":  srv.ClientKeyPath(),
+		},
+	}
+	require.NoError(t, o.Init(context.Background(), "test-otlp", cfgMap,
+		outputs.WithLogger(log.New(io.Discard, "", 0)),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	))
+	defer o.Close()
+
+	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.Equal(t, "", gotEncoding, "compression: none must produce no Content-Encoding header")
+}
+
+// Decision-path: validateConfig must reject compression values outside the allowed set.
+func TestValidateConfig_RejectsBadCompression(t *testing.T) {
+	o := &otlpOutput{}
+	cfg := &config{
+		Endpoint:    "localhost:4318",
+		Protocol:    "http",
+		Compression: "snappy", // not none/gzip
+	}
+	o.setDefaultsFor(cfg)
+	cfg.Compression = "snappy" // re-apply in case defaults changed it
+	err := o.validateConfig(cfg)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "compression")
+}
+
+// Decision-path: needsTransportRebuild must trigger on compression change.
+// (Complements the table in Task 8 with the case that became valid in Task 10.)
+func TestNeedsTransportRebuild_CompressionDiff(t *testing.T) {
+	base := &config{Endpoint: "x:4318", Protocol: "http", Compression: "gzip"}
+	changed := &config{Endpoint: "x:4318", Protocol: "http", Compression: "none"}
+	require.True(t, needsTransportRebuild(base, changed))
+	require.True(t, needsTransportRebuild(changed, base))
 }

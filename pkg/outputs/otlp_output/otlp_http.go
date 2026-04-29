@@ -10,6 +10,7 @@ package otlp_output
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -222,11 +223,27 @@ func (o *otlpOutput) sendHTTP(ctx context.Context, req *metricsv1.ExportMetricsS
 		return fmt.Errorf("HTTP client not initialized")
 	}
 
-	body, err := proto.Marshal(req)
+	raw, err := proto.Marshal(req)
 	if err != nil {
 		// proto.Marshal can fail for requests containing invalid UTF-8 in string
 		// fields (proto3 mandates valid UTF-8). Tested in TestSendHTTP_MarshalRejectsInvalidUTF8.
 		return fmt.Errorf("marshal OTLP request: %w", err)
+	}
+
+	body := raw
+	useGzip := o.cfg.Load().Compression == "gzip"
+	if useGzip {
+		var buf bytes.Buffer
+		gw := gzip.NewWriter(&buf)
+		if _, err := gw.Write(raw); err != nil {
+			// unreachable: gzip.Writer over a *bytes.Buffer cannot return an error.
+			return fmt.Errorf("gzip encode: %w", err)
+		}
+		if err := gw.Close(); err != nil {
+			// unreachable: same as above — flushing to bytes.Buffer cannot fail.
+			return fmt.Errorf("gzip close: %w", err)
+		}
+		body = buf.Bytes()
 	}
 
 	cfg := o.cfg.Load()
@@ -243,6 +260,9 @@ func (o *otlpOutput) sendHTTP(ctx context.Context, req *metricsv1.ExportMetricsS
 		return fmt.Errorf("build HTTP request: %w", err)
 	}
 	httpReq.Header = hs.headers.Clone()
+	if useGzip {
+		httpReq.Header.Set("Content-Encoding", "gzip")
+	}
 
 	resp, err := hs.client.Do(httpReq)
 	if err != nil {

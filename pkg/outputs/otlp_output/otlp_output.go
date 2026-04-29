@@ -41,13 +41,14 @@ import (
 )
 
 const (
-	outputType        = "otlp"
-	defaultTimeout    = 10 * time.Second
-	defaultBatchSize  = 1000
-	defaultNumWorkers = 1
-	defaultMaxRetries = 3
-	defaultProtocol   = "grpc"
-	loggingPrefix     = "[otlp_output:%s] "
+	outputType             = "otlp"
+	defaultTimeout         = 10 * time.Second
+	defaultBatchSize       = 1000
+	defaultNumWorkers      = 1
+	defaultMaxRetries      = 3
+	defaultProtocol        = "grpc"
+	defaultCompressionHTTP = "gzip" // default-on for protocol: http; gRPC unaffected
+	loggingPrefix          = "[otlp_output:%s] "
 	// maxRetryAfter caps a server-supplied Retry-After to prevent a single bad
 	// response from pinning a worker for arbitrarily long. Operators rebalancing
 	// or upgrading Panoptes occasionally emit large values.
@@ -108,6 +109,11 @@ type config struct {
 	BatchSize  int           `mapstructure:"batch-size,omitempty"`
 	Interval   time.Duration `mapstructure:"interval,omitempty"`
 	BufferSize int           `mapstructure:"buffer-size,omitempty"`
+
+	// Compression applied to the HTTP request body. Only honored when protocol: http.
+	// Valid values: "none", "gzip". Defaults to "gzip" when protocol is "http".
+	// The gRPC path ignores this field.
+	Compression string `mapstructure:"compression,omitempty"`
 
 	// Retry
 	MaxRetries int `mapstructure:"max-retries,omitempty"`
@@ -670,6 +676,9 @@ func (o *otlpOutput) setDefaultsFor(c *config) {
 	if c.Protocol == "" {
 		c.Protocol = defaultProtocol
 	}
+	if c.Protocol == "http" && c.Compression == "" {
+		c.Compression = defaultCompressionHTTP
+	}
 	if c.Name == "" {
 		c.Name = "gnmic-otlp-" + uuid.New().String()
 	}
@@ -691,6 +700,12 @@ func (o *otlpOutput) validateConfig(c *config) error {
 		// ok — setDefaultsFor populates "" → "grpc" before we get here
 	default:
 		return fmt.Errorf("unsupported protocol %q: must be 'grpc' or 'http'", c.Protocol)
+	}
+	switch c.Compression {
+	case "", "none", "gzip":
+		// ok ("" remains valid for grpc protocol where the field is ignored)
+	default:
+		return fmt.Errorf("invalid compression %q: must be one of 'none' or 'gzip'", c.Compression)
 	}
 	if c.Endpoint == "" {
 		return fmt.Errorf("endpoint is required")
@@ -808,5 +823,6 @@ func needsTransportRebuild(old, nw *config) bool {
 	}
 	return old.Endpoint != nw.Endpoint ||
 		old.Protocol != nw.Protocol ||
+		old.Compression != nw.Compression ||
 		!old.TLS.Equal(nw.TLS)
 }
