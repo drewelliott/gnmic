@@ -956,3 +956,50 @@ func TestNeedsTransportRebuild_Table(t *testing.T) {
 		})
 	}
 }
+
+func TestOTLP_Close_HTTPReleasesConnections(t *testing.T) {
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	o := &otlpOutput{}
+	cfgMap := map[string]interface{}{
+		"type":     "otlp",
+		"endpoint": srv.URL,
+		"protocol": "http",
+		"tls": map[string]interface{}{
+			"ca-file":   srv.CAPath(),
+			"cert-file": srv.ClientCertPath(),
+			"key-file":  srv.ClientKeyPath(),
+		},
+	}
+	require.NoError(t, o.Init(context.Background(), "test-otlp", cfgMap,
+		outputs.WithLogger(log.New(io.Discard, "", 0)),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	))
+
+	// Close must not error and must not panic even though grpcState is nil.
+	require.NoError(t, o.Close())
+
+	// Second Close should be idempotent.
+	require.NoError(t, o.Close())
+}
+
+// Decision-path: Close after initFields ran but before any transport state was
+// stored — exercises every Swap(nil) path returning nil, the cancelFn nil
+// guard, and the eventCh nil guard. Does NOT test the genuinely-zero-value
+// case (initFields never ran) — Close is only required to be safe on the
+// post-initFields surface, which is what every real Init call produces.
+//
+// Note: otlpOutput.wg is *sync.WaitGroup (pointer), not a value, so calling
+// Close without running initFields first would nil-deref. We call initFields
+// directly to mirror the post-Init shape; this is package-private so the test
+// can reach it.
+func TestOTLP_Close_AfterInitFieldsButBeforeTransportStored(t *testing.T) {
+	o := &otlpOutput{}
+	o.initFields()
+	o.logger = log.New(io.Discard, "", 0)
+
+	require.NoError(t, o.Close())
+}

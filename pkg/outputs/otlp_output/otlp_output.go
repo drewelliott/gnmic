@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"regexp"
 	"slices"
 	"sync"
@@ -502,28 +503,34 @@ func (o *otlpOutput) WriteEvent(ctx context.Context, ev *formatters.EventMsg) {
 	}
 }
 
-// Close closes the OTLP output
+// Close closes the OTLP output. Safe to call multiple times.
 func (o *otlpOutput) Close() error {
 	if o.cancelFn != nil {
 		o.cancelFn()
+		o.cancelFn = nil
 	}
 
-	// Close event channel
-	eventCh := o.eventCh.Load()
-	if eventCh != nil {
-		close(*eventCh)
+	// Close event channel once.
+	if ch := o.eventCh.Swap(nil); ch != nil {
+		close(*ch)
 	}
 
 	// Wait for workers to finish
 	o.wg.Wait()
 
-	// Close gRPC connection
-	gs := o.grpcState.Load()
-	if gs != nil && gs.conn != nil {
-		return gs.conn.Close()
+	// Tear down transport state. Either (but not both) will be populated in practice.
+	var firstErr error
+	if gs := o.grpcState.Swap(nil); gs != nil && gs.conn != nil {
+		if err := gs.conn.Close(); err != nil {
+			firstErr = err
+		}
 	}
-
-	return nil
+	if hs := o.httpState.Swap(nil); hs != nil && hs.client != nil {
+		if t, ok := hs.client.Transport.(*http.Transport); ok {
+			t.CloseIdleConnections()
+		}
+	}
+	return firstErr
 }
 
 // worker processes events in batches
@@ -539,7 +546,11 @@ func (o *otlpOutput) worker(ctx context.Context, id int) {
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 
-	eventCh := *o.eventCh.Load()
+	chPtr := o.eventCh.Load()
+	if chPtr == nil {
+		return
+	}
+	eventCh := *chPtr
 
 	for {
 		select {
