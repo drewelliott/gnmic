@@ -66,10 +66,10 @@ type otlpOutput struct {
 	outputs.BaseOutput
 
 	state *atomic.Pointer[outputState]
-	// stateMu serializes the (Load, state.inFlight.Add(1)) pair in sendBatch
-	// with Update's (Swap, start Wait) so we never Add to a WaitGroup whose
-	// Wait has already returned 0. Held briefly — no contention at gnmic
-	// batching rates (1-10 Hz).
+	// stateMu serializes the (Load, state.transport.inFlight.Add(1)) pair in
+	// sendBatch with Update's (Swap, start Wait) so we never Add to a
+	// WaitGroup whose Wait has already returned 0. Held briefly — no
+	// contention at gnmic batching rates (1-10 Hz).
 	stateMu sync.Mutex
 	dynCfg  *atomic.Pointer[dynConfig]
 	eventCh *atomic.Pointer[chan *formatters.EventMsg]
@@ -85,40 +85,62 @@ type otlpOutput struct {
 	store store.Store[any]
 }
 
+// transportState owns the protocol-level connection (gRPC conn or HTTP
+// Transport) and the inFlight WaitGroup that tracks every batch currently
+// using it. It is held by outputState through a pointer so a config-only
+// reload can publish a new outputState that shares the same transportState
+// — every concurrent batch, regardless of which outputState revision it
+// captured, increments the same inFlight. A subsequent rebuild reload
+// allocates a new transportState; cleanup of the old transportState
+// blocks on its inFlight before closing the underlying conn/Transport,
+// so an active batch can never observe a torn-down transport.
+//
+// transportState contains a sync.WaitGroup, so it must never be copied —
+// only passed/stored as *transportState.
+type transportState struct {
+	grpcState *grpcClientState // nil when protocol != grpc
+	httpState *httpClientState // nil when protocol != http
+
+	// inFlight tracks every concurrent user of this transport, across all
+	// outputStates that share this *transportState. sendBatch increments
+	// under stateMu before unlocking; Done() fires from a defer. Cleanup
+	// (in Update's rebuild path and Close) Waits on this before closing
+	// conn/Transport.
+	inFlight sync.WaitGroup
+}
+
+// cleanup releases the transport-level resources held here.
+// Safe on a nil receiver and on a transportState whose protocol-specific
+// fields are already nil.
+func (t *transportState) cleanup() {
+	if t == nil {
+		return
+	}
+	if t.grpcState != nil && t.grpcState.conn != nil {
+		_ = t.grpcState.conn.Close()
+	}
+	if t.httpState != nil && t.httpState.client != nil {
+		if tr, ok := t.httpState.client.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	}
+}
+
 // outputState bundles the consistent (cfg, transport) tuple. Workers Load()
 // this once at the top of sendBatch and dispatch against the snapshot — a
 // concurrent Update() that swaps protocol cannot tear the pair, eliminating
 // the "X client not initialized" race when a worker raced cfg.Load against
-// transport-pointer Swap. Cleanup of an old state's transports waits on
-// inFlight (see Update) so the underlying conn/Transport is closed only
-// after every in-flight batch using this state has completed.
+// transport-pointer Swap.
+//
+// Config-only reloads share the same *transportState pointer with the
+// previous outputState; only a transport-rebuild reload allocates a new
+// transportState. This guarantees that the inFlight WaitGroup which
+// cleanup waits on really does account for every batch in flight on
+// that transport, regardless of how many config-only reloads were layered
+// on top of it.
 type outputState struct {
 	cfg       *config
-	grpcState *grpcClientState // nil when protocol != grpc
-	httpState *httpClientState // nil when protocol != http
-
-	// inFlight tracks concurrent users of this state. sendBatch increments via
-	// Add(1) under stateMu before unlocking; Done() fires from a defer in
-	// sendBatch. Update's rebuild path Wait()s on this before cleanup, so
-	// transport teardown happens only after the last batch using this state
-	// has completed — regardless of timeout/retries/Retry-After.
-	inFlight sync.WaitGroup
-}
-
-// cleanup releases the transport-level resources held by this state.
-// Safe on a nil receiver and on a state whose transports are already nil.
-func (s *outputState) cleanup() {
-	if s == nil {
-		return
-	}
-	if s.grpcState != nil && s.grpcState.conn != nil {
-		_ = s.grpcState.conn.Close()
-	}
-	if s.httpState != nil && s.httpState.client != nil {
-		if t, ok := s.httpState.client.Transport.(*http.Transport); ok {
-			t.CloseIdleConnections()
-		}
-	}
+	transport *transportState
 }
 
 type dynConfig struct {
@@ -236,26 +258,26 @@ func (o *otlpOutput) String() string {
 // path is exclusively transport-init failures; callers handle protocol-level
 // validation upstream via validateConfig.
 func (o *otlpOutput) buildOutputState(cfg *config) (*outputState, error) {
-	s := &outputState{cfg: cfg}
+	t := &transportState{}
 	switch cfg.Protocol {
 	case "grpc":
 		gs, err := o.initGRPCFor(cfg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize gRPC transport: %w", err)
 		}
-		s.grpcState = gs
+		t.grpcState = gs
 	case "http":
 		hs, err := o.initHTTPFor(cfg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize HTTP transport: %w", err)
 		}
-		s.httpState = hs
+		t.httpState = hs
 	default:
 		// unreachable: validateConfig rejects this earlier. Kept as a
 		// defensive belt-and-suspenders to mirror Init's old switch.
 		return nil, fmt.Errorf("unsupported protocol %q: must be 'grpc' or 'http'", cfg.Protocol)
 	}
-	return s, nil
+	return &outputState{cfg: cfg, transport: t}, nil
 }
 
 // Init initializes the OTLP output
@@ -389,31 +411,33 @@ func (o *otlpOutput) Update(ctx context.Context, cfg map[string]any) error {
 		oldState := o.state.Swap(newState)
 		o.stateMu.Unlock()
 		// Cleanup waits for actual in-flight users to drain — no wall-clock
-		// guess. After all sendBatch calls holding oldState complete (their
-		// state.inFlight.Done() fires), the WaitGroup unblocks and we close
-		// the underlying transport. Run async so Update returns promptly.
-		// Swap returns nil if Update races Init (defensive — reachable
-		// through some test paths).
+		// guess. inFlight lives on transportState, so it accounts for every
+		// batch using this transport across any config-only reloads that
+		// were layered on top of it. After they all complete (Done fires),
+		// the WaitGroup unblocks and we close the underlying transport.
+		// Run async so Update returns promptly. Swap returns nil if Update
+		// races Init (defensive — reachable through some test paths).
 		if oldState != nil {
 			go func() {
-				oldState.inFlight.Wait()
-				oldState.cleanup()
+				oldState.transport.inFlight.Wait()
+				oldState.transport.cleanup()
 			}()
 		}
 	} else {
-		// Cfg-only change. Share transport pointers with the previous state.
-		// The nil-currState case is structurally unreachable here:
+		// Cfg-only change. Share the *transportState pointer with the
+		// previous state so a single inFlight WaitGroup tracks every batch
+		// using this transport across all config-only reloads. The
+		// nil-currState case is structurally unreachable here:
 		// needsTransportRebuild(nil, X) returns true, so we'd be in the if-branch
 		// above. The guard below is belt-and-suspenders. See Appendix D.
 		newState := &outputState{cfg: newCfg}
 		if currState != nil {
-			newState.grpcState = currState.grpcState
-			newState.httpState = currState.httpState
+			newState.transport = currState.transport
 		}
 		o.stateMu.Lock()
 		o.state.Store(newState)
 		o.stateMu.Unlock()
-		// No cleanup — transports are still live in newState (shared pointers).
+		// No cleanup — the transport is still live and shared with newState.
 	}
 
 	if swapChannel || restartWorkers {
@@ -597,17 +621,17 @@ func (o *otlpOutput) Close() error {
 
 	// Cleanup transport state. By this point all workers have exited
 	// (wg.Wait returned), so no goroutine holds an outputState reference —
-	// every state.inFlight has already drained to zero. The lock around the
-	// Swap preserves the same invariant Update relies on (no Add can race a
-	// Wait), protecting any future code path that holds state without going
-	// through sendBatch. cleanup() handles a nil receiver and a state whose
-	// transports are already nil, so the post-initFields pre-Init shape is
-	// also safe.
+	// the transport's inFlight has already drained to zero. The lock around
+	// the Swap preserves the same invariant Update relies on (no Add can
+	// race a Wait), protecting any future code path that holds state
+	// without going through sendBatch. cleanup() handles a nil receiver
+	// and a transportState whose protocol-specific fields are already nil,
+	// so the post-initFields pre-Init shape is also safe.
 	o.stateMu.Lock()
 	oldState := o.state.Swap(nil)
 	o.stateMu.Unlock()
 	if oldState != nil {
-		oldState.cleanup()
+		oldState.transport.cleanup()
 	}
 	return nil
 }
@@ -685,9 +709,9 @@ func (o *otlpOutput) sendBatch(ctx context.Context, events []*formatters.EventMs
 	// returned 0 (which would panic per sync.WaitGroup contract).
 	o.stateMu.Lock()
 	state := o.state.Load()
-	state.inFlight.Add(1)
+	state.transport.inFlight.Add(1)
 	o.stateMu.Unlock()
-	defer state.inFlight.Done()
+	defer state.transport.inFlight.Done()
 	cfg := state.cfg
 	start := time.Now()
 

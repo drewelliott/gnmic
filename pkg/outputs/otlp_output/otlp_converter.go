@@ -447,7 +447,7 @@ func (o *otlpOutput) validateMetricData(rmIdx, smIdx, mIdx int, m *metricspb.Met
 // sendGRPC sends the OTLP metrics via gRPC
 func (o *otlpOutput) sendGRPC(ctx context.Context, state *outputState, req *metricsv1.ExportMetricsServiceRequest) error {
 	cfg := state.cfg
-	gs := state.grpcState
+	gs := state.transport.grpcState
 
 	if gs == nil || gs.client == nil {
 		// Belt-and-suspenders: when Protocol == "grpc", buildOutputState

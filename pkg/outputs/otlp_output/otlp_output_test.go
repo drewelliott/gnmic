@@ -47,7 +47,7 @@ func newTestOutput(cfg *config) *otlpOutput {
 	}
 	o := &otlpOutput{}
 	o.state = new(atomic.Pointer[outputState])
-	o.state.Store(&outputState{cfg: cfg})
+	o.state.Store(&outputState{cfg: cfg, transport: &transportState{}})
 	o.logger = log.New(io.Discard, "", 0)
 	return o
 }
@@ -733,7 +733,7 @@ func TestOTLP_InitSucceedsWithUnreachableEndpoint(t *testing.T) {
 
 	state := output.state.Load()
 	require.NotNil(t, state, "outputState should be created")
-	gs := state.grpcState
+	gs := state.transport.grpcState
 	assert.NotNil(t, gs, "gRPC state should be created")
 	assert.NotNil(t, gs.conn, "gRPC connection should be created")
 	assert.NotNil(t, gs.client, "gRPC client should be created")

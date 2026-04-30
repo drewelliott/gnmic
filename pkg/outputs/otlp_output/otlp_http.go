@@ -235,7 +235,7 @@ func (o *otlpOutput) initHTTPFor(cfg *config) (*httpClientState, error) {
 }
 
 func (o *otlpOutput) sendHTTP(ctx context.Context, state *outputState, req *metricsv1.ExportMetricsServiceRequest) error {
-	hs := state.httpState
+	hs := state.transport.httpState
 	if hs == nil {
 		// Belt-and-suspenders: when Protocol == "http", buildOutputState
 		// guarantees httpState is populated. This guard catches partial

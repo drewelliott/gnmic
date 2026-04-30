@@ -294,7 +294,7 @@ func TestInitHTTPFor_WithMTLS(t *testing.T) {
 	require.Contains(t, hs.endpoint, "/v1/metrics")
 
 	// Headers are built per-request now, so verify they arrive at the server.
-	o.state.Store(&outputState{cfg: cfg, httpState: hs})
+	o.state.Store(&outputState{cfg: cfg, transport: &transportState{httpState: hs}})
 	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{}))
 	require.Equal(t, "application/x-protobuf", gotContentType)
 	require.Equal(t, "tenant-1", gotOrgID)
@@ -438,7 +438,7 @@ func TestSendHTTP_SuccessfulExport(t *testing.T) {
 
 	hs, err := o.initHTTPFor(cfg)
 	require.NoError(t, err)
-	o.state.Store(&outputState{cfg: cfg, httpState: hs})
+	o.state.Store(&outputState{cfg: cfg, transport: &transportState{httpState: hs}})
 
 	// Minimal valid ExportMetricsServiceRequest.
 	req := &metricsv1.ExportMetricsServiceRequest{}
@@ -453,19 +453,19 @@ func TestSendHTTP_SuccessfulExport(t *testing.T) {
 }
 
 // withCfg applies a mutation to a copy of the current config and atomically
-// publishes a new outputState carrying the same transport pointers.
+// publishes a new outputState that shares the same *transportState pointer.
 // Test-only convenience — production reloads via Update(). Direct mutation
 // of state.Load().cfg is an unsynchronized write that defeats atomic.Pointer;
-// this helper does it safely. Note: outputState contains a sync.WaitGroup
-// (noCopy), so we field-copy explicitly rather than dereferencing.
+// this helper does it safely. Sharing the transport pointer matches Update's
+// no-rebuild path (and avoids the WaitGroup-copy issue that would arise from
+// allocating a fresh transportState for every cfg-only test mutation).
 func withCfg(o *otlpOutput, mutate func(*config)) {
 	oldState := o.state.Load()
 	cfg := *oldState.cfg
 	mutate(&cfg)
 	newState := &outputState{
 		cfg:       &cfg,
-		grpcState: oldState.grpcState,
-		httpState: oldState.httpState,
+		transport: oldState.transport,
 	}
 	o.state.Store(newState)
 }
@@ -490,7 +490,7 @@ func newHTTPTestOutput(t *testing.T, srv *mTLSTestServer) *otlpOutput {
 	}
 	hs, err := o.initHTTPFor(cfg)
 	require.NoError(t, err)
-	o.state.Store(&outputState{cfg: cfg, httpState: hs})
+	o.state.Store(&outputState{cfg: cfg, transport: &transportState{httpState: hs}})
 	return o
 }
 
@@ -502,7 +502,7 @@ func TestSendHTTP_NoStateInitialized(t *testing.T) {
 	o := &otlpOutput{}
 	o.state = new(atomic.Pointer[outputState])
 	o.logger = log.New(io.Discard, "", 0)
-	state := &outputState{cfg: &config{Protocol: "http", Endpoint: "https://x"}}
+	state := &outputState{cfg: &config{Protocol: "http", Endpoint: "https://x"}, transport: &transportState{}}
 	o.state.Store(state)
 
 	err := o.sendHTTP(context.Background(), state, &metricsv1.ExportMetricsServiceRequest{})
@@ -1126,7 +1126,7 @@ func TestSendHTTP_GzipCompression(t *testing.T) {
 	cfg := o.state.Load().cfg
 	hs, err := o.initHTTPFor(cfg)
 	require.NoError(t, err)
-	o.state.Store(&outputState{cfg: cfg, httpState: hs})
+	o.state.Store(&outputState{cfg: cfg, transport: &transportState{httpState: hs}})
 
 	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{}))
 	require.Equal(t, "gzip", gotEncoding)
@@ -1293,10 +1293,10 @@ func TestUpdate_TransportNotClosedWhileBatchInFlight(t *testing.T) {
 	// Start an in-flight sendHTTP via sendBatch. Use a goroutine so the
 	// caller doesn't block on the server hang.
 	state := o.state.Load()
-	state.inFlight.Add(1)
+	state.transport.inFlight.Add(1)
 	sendDone := make(chan error, 1)
 	go func() {
-		defer state.inFlight.Done()
+		defer state.transport.inFlight.Done()
 		sendDone <- o.sendHTTP(context.Background(), state, &metricsv1.ExportMetricsServiceRequest{})
 	}()
 
@@ -1311,7 +1311,7 @@ func TestUpdate_TransportNotClosedWhileBatchInFlight(t *testing.T) {
 	newCfg := *o.state.Load().cfg
 	newHS, err := o.initHTTPFor(&newCfg)
 	require.NoError(t, err)
-	newState := &outputState{cfg: &newCfg, httpState: newHS}
+	newState := &outputState{cfg: &newCfg, transport: &transportState{httpState: newHS}}
 
 	o.stateMu.Lock()
 	oldState := o.state.Swap(newState)
@@ -1320,8 +1320,8 @@ func TestUpdate_TransportNotClosedWhileBatchInFlight(t *testing.T) {
 	// Track when cleanup actually fires.
 	cleanupDone := make(chan struct{})
 	go func() {
-		oldState.inFlight.Wait()
-		oldState.cleanup()
+		oldState.transport.inFlight.Wait()
+		oldState.transport.cleanup()
 		close(cleanupDone)
 	}()
 
@@ -1343,6 +1343,94 @@ func TestUpdate_TransportNotClosedWhileBatchInFlight(t *testing.T) {
 	select {
 	case <-cleanupDone:
 		// expected: cleanup fired once the WaitGroup drained
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup never fired after the in-flight batch completed")
+	}
+}
+
+// Decision-path: a config-only reload between an in-flight batch and a
+// transport-rebuild reload must not let the rebuild close a transport that
+// the original state is still using. The fix shares *transportState across
+// config-only reloads so a single inFlight WaitGroup tracks all batches on
+// that transport.
+//
+// Two-step scenario:
+//  1. Init publishes S1 = {cfg1, T1}. Batch A starts on S1, increments
+//     T1.inFlight.
+//  2. Config-only reload publishes S2 = {cfg2, T1} — same *transportState
+//     pointer. Batch A is still running, holding T1.inFlight.
+//  3. Rebuild reload publishes S3 = {cfg3, T2}. The async cleanup goroutine
+//     waits on oldState.transport.inFlight which == T1.inFlight, so it
+//     correctly blocks until batch A finishes before closing T1.
+func TestUpdate_TwoStepReload_TransportSharedAcrossConfigOnly(t *testing.T) {
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+
+	// S1: published by newHTTPTestOutput.
+	s1 := o.state.Load()
+
+	// Simulate batch A starting on S1: take a count on the transport's
+	// inFlight WaitGroup. The (Load, Add) pair would be serialized via
+	// stateMu in production sendBatch; we mirror that here.
+	o.stateMu.Lock()
+	s1.transport.inFlight.Add(1)
+	o.stateMu.Unlock()
+
+	// Config-only reload: same Headers tweak, transport pointer reused.
+	// This matches Update's no-rebuild path and the withCfg helper, both of
+	// which share the *transportState pointer rather than allocating a new
+	// one (which would create a fresh, empty inFlight WaitGroup).
+	cfg2 := *s1.cfg
+	cfg2.Headers = map[string]string{"X-Scope-OrgID": "tenant-config-only"}
+	s2 := &outputState{cfg: &cfg2, transport: s1.transport}
+	o.stateMu.Lock()
+	o.state.Store(s2)
+	o.stateMu.Unlock()
+
+	// Sanity: same transport pointer across S1 and S2.
+	require.Same(t, s1.transport, s2.transport,
+		"config-only reload must share *transportState — not allocate a new one")
+
+	// Rebuild reload: build a new transportState. Cleanup of the old state
+	// must Wait on s1.transport.inFlight (== s2.transport.inFlight), which
+	// is non-zero because batch A is still running.
+	cfg3 := *s2.cfg
+	newHS, err := o.initHTTPFor(&cfg3)
+	require.NoError(t, err)
+	s3 := &outputState{cfg: &cfg3, transport: &transportState{httpState: newHS}}
+
+	o.stateMu.Lock()
+	oldState := o.state.Swap(s3)
+	o.stateMu.Unlock()
+
+	// The rebuild's async cleanup mirrors Update's rebuild path.
+	cleanupDone := make(chan struct{})
+	go func() {
+		oldState.transport.inFlight.Wait()
+		oldState.transport.cleanup()
+		close(cleanupDone)
+	}()
+
+	// Cleanup must be blocked: batch A is still in flight on the shared
+	// transport. With the buggy pre-fix code, oldState (== s2) had a fresh
+	// empty inFlight, Wait() returned immediately, and cleanup tore down T1
+	// while batch A was still using it.
+	select {
+	case <-cleanupDone:
+		t.Fatal("cleanup completed before in-flight batch finished — transport could be closed under an active batch")
+	case <-time.After(50 * time.Millisecond):
+		// good: still blocked
+	}
+
+	// Releasing batch A unblocks cleanup.
+	s1.transport.inFlight.Done()
+	select {
+	case <-cleanupDone:
+		// expected
 	case <-time.After(2 * time.Second):
 		t.Fatal("cleanup never fired after the in-flight batch completed")
 	}
