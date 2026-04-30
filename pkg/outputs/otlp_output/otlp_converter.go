@@ -33,9 +33,7 @@ var stringsBuilderPool = sync.Pool{
 }
 
 // convertToOTLP converts gNMI EventMsg slice to OTLP ExportMetricsServiceRequest
-func (o *otlpOutput) convertToOTLP(events []*formatters.EventMsg) *metricsv1.ExportMetricsServiceRequest {
-	cfg := o.loadCfg()
-
+func (o *otlpOutput) convertToOTLP(cfg *config, events []*formatters.EventMsg) *metricsv1.ExportMetricsServiceRequest {
 	if cfg.Debug {
 		o.logger.Printf("DEBUG: convertToOTLP called with %d events", len(events))
 	}

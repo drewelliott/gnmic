@@ -74,7 +74,7 @@ func TestOTLP_MessageStructure(t *testing.T) {
 	output := newTestOutput(&config{
 		Endpoint: "localhost:4317",
 	})
-	otlpMetrics := output.convertToOTLP([]*formatters.EventMsg{event})
+	otlpMetrics := output.convertToOTLP(output.state.Load().cfg, []*formatters.EventMsg{event})
 
 	// Then: Should have proper OTLP structure
 	require.NotNil(t, otlpMetrics)
@@ -111,7 +111,7 @@ func TestOTLP_ResourceAttributes(t *testing.T) {
 
 	// When: Converting to OTLP
 	output := newTestOutput(&config{})
-	otlpMetrics := output.convertToOTLP([]*formatters.EventMsg{event})
+	otlpMetrics := output.convertToOTLP(output.state.Load().cfg, []*formatters.EventMsg{event})
 
 	// Then: Resource attributes should match metadata
 	resource := otlpMetrics.ResourceMetrics[0].Resource
@@ -141,7 +141,7 @@ func TestOTLP_PathKeysAsAttributes(t *testing.T) {
 
 	// When: Converting to OTLP
 	output := newTestOutput(&config{})
-	otlpMetrics := output.convertToOTLP([]*formatters.EventMsg{event})
+	otlpMetrics := output.convertToOTLP(output.state.Load().cfg, []*formatters.EventMsg{event})
 
 	// Then: Path key becomes attribute
 	dataPoint := otlpMetrics.ResourceMetrics[0].ScopeMetrics[0].Metrics[0].GetSum().DataPoints[0]
@@ -193,7 +193,7 @@ func TestOTLP_MetricTypeDetection(t *testing.T) {
 			}
 
 			output := newTestOutput(&config{})
-			otlpMetrics := output.convertToOTLP([]*formatters.EventMsg{event})
+			otlpMetrics := output.convertToOTLP(output.state.Load().cfg, []*formatters.EventMsg{event})
 			metric := otlpMetrics.ResourceMetrics[0].ScopeMetrics[0].Metrics[0]
 
 			switch tt.expectedType {
@@ -317,7 +317,7 @@ func TestOTLP_StringValuesAsAttributes(t *testing.T) {
 
 	// When: Converting with strings-as-attributes enabled
 	output := newTestOutput(&config{StringsAsAttributes: true})
-	otlpMetrics := output.convertToOTLP([]*formatters.EventMsg{event})
+	otlpMetrics := output.convertToOTLP(output.state.Load().cfg, []*formatters.EventMsg{event})
 
 	// Then: Should create gauge with value=1 and status as attribute
 	metric := otlpMetrics.ResourceMetrics[0].ScopeMetrics[0].Metrics[0]
@@ -349,7 +349,7 @@ func TestOTLP_SubscriptionNameMapping(t *testing.T) {
 
 	// When: Converting with append-subscription-name enabled
 	output := newTestOutput(&config{AppendSubscriptionName: true})
-	otlpMetrics := output.convertToOTLP([]*formatters.EventMsg{event})
+	otlpMetrics := output.convertToOTLP(output.state.Load().cfg, []*formatters.EventMsg{event})
 
 	// Then: subscription_name should be in attributes
 	dataPoint := otlpMetrics.ResourceMetrics[0].ScopeMetrics[0].Metrics[0].GetSum().DataPoints[0]
@@ -583,7 +583,7 @@ func TestOTLP_ResourceTagKeys(t *testing.T) {
 			output := newTestOutput(&config{
 				ResourceTagKeys: tt.resourceTagKeys,
 			})
-			otlpMetrics := output.convertToOTLP([]*formatters.EventMsg{event})
+			otlpMetrics := output.convertToOTLP(output.state.Load().cfg, []*formatters.EventMsg{event})
 
 			require.NotNil(t, otlpMetrics)
 			require.Len(t, otlpMetrics.ResourceMetrics, 1)
@@ -669,7 +669,7 @@ func TestOTLP_ResourceAttributesBehavior(t *testing.T) {
 			output := newTestOutput(&config{
 				ResourceTagKeys: tt.resourceTagKeys,
 			})
-			otlpMetrics := output.convertToOTLP([]*formatters.EventMsg{event})
+			otlpMetrics := output.convertToOTLP(output.state.Load().cfg, []*formatters.EventMsg{event})
 
 			require.NotNil(t, otlpMetrics)
 			resource := otlpMetrics.ResourceMetrics[0].Resource
@@ -706,7 +706,7 @@ func TestOTLP_ConfiguredResourceAttributesAlwaysIncluded(t *testing.T) {
 			"service.version": "0.42.0",
 		},
 	})
-	otlpMetrics := output.convertToOTLP([]*formatters.EventMsg{event})
+	otlpMetrics := output.convertToOTLP(output.state.Load().cfg, []*formatters.EventMsg{event})
 
 	resource := otlpMetrics.ResourceMetrics[0].Resource
 	resourceAttrs := extractAttributesMap(resource.Attributes)

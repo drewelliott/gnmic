@@ -650,7 +650,7 @@ func (o *otlpOutput) sendBatch(ctx context.Context, events []*formatters.EventMs
 	cfg := state.cfg
 	start := time.Now()
 
-	req := o.convertToOTLP(events)
+	req := o.convertToOTLP(cfg, events)
 
 	var err error
 retry:
