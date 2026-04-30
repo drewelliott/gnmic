@@ -1118,3 +1118,47 @@ func TestNeedsTransportRebuild_CompressionDiff(t *testing.T) {
 	require.True(t, needsTransportRebuild(base, changed))
 	require.True(t, needsTransportRebuild(changed, base))
 }
+
+// Decision-path: PartialSuccess responses must NOT be retried (per OTLP spec).
+// Drives sendBatch (NOT sendHTTP directly) to exercise the retry-loop dispatch.
+func TestSendBatch_HTTPPartialSuccessNotRetried(t *testing.T) {
+	var calls int
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		respProto := &metricsv1.ExportMetricsServiceResponse{
+			PartialSuccess: &metricsv1.ExportMetricsPartialSuccess{
+				RejectedDataPoints: 5,
+				ErrorMessage:       "schema validation failed",
+			},
+		}
+		body, _ := proto.Marshal(respProto)
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	withCfg(o, func(c *config) {
+		c.MaxRetries = 5
+		c.resourceTagSet = map[string]bool{}
+	})
+
+	events := []*formatters.EventMsg{{
+		Name: "test", Timestamp: time.Now().UnixNano(),
+		Tags:   map[string]string{"source": "x"},
+		Values: map[string]interface{}{"value": int64(1)},
+	}}
+	o.sendBatch(context.Background(), events)
+
+	require.Equal(t, 1, calls, "PartialSuccess must not retry — server already accepted points")
+}
+
+// Decision-path: isPartialSuccessError detects the typed sentinel.
+func TestIsPartialSuccessError(t *testing.T) {
+	require.True(t, isPartialSuccessError(&partialSuccessError{rejected: 3, errorMessage: "x"}))
+	require.False(t, isPartialSuccessError(fmt.Errorf("plain error")))
+	require.False(t, isPartialSuccessError(nil))
+	// httpExportError must NOT match — it's a different category.
+	require.False(t, isPartialSuccessError(&httpExportError{status: 503}))
+}

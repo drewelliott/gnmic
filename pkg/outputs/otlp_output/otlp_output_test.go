@@ -910,6 +910,76 @@ func TestOTLP_ChannelCloseFlushes(t *testing.T) {
 	assert.Greater(t, server.ReceivedMetricsCount(), 0, "Remaining batch should be flushed when channel closes")
 }
 
+// Decision-path: PartialSuccess on gRPC must NOT be retried (parity with HTTP).
+// Drives the public sendBatch path through the gRPC mock server.
+func TestSendBatch_GRPCPartialSuccessNotRetried(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	server := grpc.NewServer()
+	mock := &mockPartialSuccessServer{rejected: 5}
+	metricsv1.RegisterMetricsServiceServer(server, mock)
+	go server.Serve(listener)
+	defer server.Stop()
+
+	o := &otlpOutput{}
+	cfgMap := map[string]interface{}{
+		"type":        "otlp",
+		"endpoint":    listener.Addr().String(),
+		"protocol":    "grpc",
+		"max-retries": 5,
+		"timeout":     "2s",
+		"batch-size":  1,
+		"interval":    "50ms",
+	}
+	require.NoError(t, o.Init(context.Background(), "test-otlp", cfgMap,
+		outputs.WithLogger(log.New(io.Discard, "", 0)),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	))
+	defer o.Close()
+
+	event := &formatters.EventMsg{
+		Name:      "test",
+		Timestamp: time.Now().UnixNano(),
+		Tags:      map[string]string{"source": "10.1.1.1:6030"},
+		Values:    map[string]interface{}{"value": int64(1)},
+	}
+	o.WriteEvent(context.Background(), event)
+
+	// Poll up to 1s for at least one Export call.
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if mock.callCount() > 0 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	// Give a generous additional 200ms to detect any retry.
+	time.Sleep(200 * time.Millisecond)
+
+	require.Equal(t, int32(1), mock.callCount(), "gRPC PartialSuccess must not retry")
+}
+
+type mockPartialSuccessServer struct {
+	metricsv1.UnimplementedMetricsServiceServer
+	rejected int64
+	calls    atomic.Int32
+}
+
+func (m *mockPartialSuccessServer) Export(ctx context.Context, req *metricsv1.ExportMetricsServiceRequest) (*metricsv1.ExportMetricsServiceResponse, error) {
+	m.calls.Add(1)
+	return &metricsv1.ExportMetricsServiceResponse{
+		PartialSuccess: &metricsv1.ExportMetricsPartialSuccess{
+			RejectedDataPoints: m.rejected,
+			ErrorMessage:       "schema validation failed",
+		},
+	}, nil
+}
+
+func (m *mockPartialSuccessServer) callCount() int32 {
+	return m.calls.Load()
+}
+
 // Helper to extract attributes map from KeyValue slice
 func extractAttributesMap(attrs []*commonpb.KeyValue) map[string]string {
 	result := make(map[string]string)

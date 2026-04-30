@@ -491,14 +491,16 @@ func (o *otlpOutput) sendGRPC(ctx context.Context, req *metricsv1.ExportMetricsS
 	}
 
 	if response.PartialSuccess != nil && response.PartialSuccess.RejectedDataPoints > 0 {
-		errMsg := fmt.Sprintf("OTEL rejected %d data points: %s",
+		o.logger.Printf("ERROR: OTEL rejected %d data points: %s",
 			response.PartialSuccess.RejectedDataPoints,
 			response.PartialSuccess.ErrorMessage)
-		o.logger.Printf("ERROR: %s", errMsg)
 		if cfg.EnableMetrics {
 			otlpRejectedDataPoints.WithLabelValues(cfg.Name).Add(float64(response.PartialSuccess.RejectedDataPoints))
 		}
-		return fmt.Errorf("%s", errMsg)
+		return &partialSuccessError{
+			rejected:     response.PartialSuccess.RejectedDataPoints,
+			errorMessage: response.PartialSuccess.ErrorMessage,
+		}
 	}
 
 	return nil

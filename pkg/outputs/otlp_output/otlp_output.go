@@ -636,9 +636,11 @@ retry:
 			return
 		}
 
-		// HTTP-only: permanent errors abort the loop; Retry-After overrides our backoff.
-		if cfg.Protocol == "http" && isPermanentHTTPError(err) {
-			o.logger.Printf("permanent HTTP error, not retrying: %v", err)
+		// Permanent errors abort the loop. isPermanentHTTPError covers HTTP status
+		// classification; isPartialSuccessError covers PartialSuccess on either
+		// transport (gRPC and HTTP both can return *partialSuccessError).
+		if isPermanentHTTPError(err) || isPartialSuccessError(err) {
+			o.logger.Printf("permanent error, not retrying: %v", err)
 			break
 		}
 

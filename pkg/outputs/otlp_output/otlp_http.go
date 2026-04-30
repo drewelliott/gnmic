@@ -63,6 +63,27 @@ func isPermanentHTTPError(err error) bool {
 	}
 }
 
+// partialSuccessError marks a 2xx response that included a non-empty
+// PartialSuccess.RejectedDataPoints. Per OTLP spec, clients MUST NOT retry
+// these — the server already accepted some points; retrying duplicates them.
+// This applies to both HTTP and gRPC transports.
+type partialSuccessError struct {
+	rejected     int64
+	errorMessage string
+}
+
+func (e *partialSuccessError) Error() string {
+	return fmt.Sprintf("OTEL rejected %d data points: %s", e.rejected, e.errorMessage)
+}
+
+// isPartialSuccessError returns true when the error is a partial-success
+// rejection. The retry loop short-circuits on this just as it does on
+// permanent HTTP errors.
+func isPartialSuccessError(err error) bool {
+	var pse *partialSuccessError
+	return errors.As(err, &pse)
+}
+
 // parseRetryAfter interprets the Retry-After header per RFC 7231 §7.1.3.
 // It accepts either a delta-seconds integer or an HTTP-date.
 // Returns 0 when the header is absent, empty, or unparseable.
@@ -290,14 +311,16 @@ func (o *otlpOutput) sendHTTP(ctx context.Context, req *metricsv1.ExportMetricsS
 			return nil
 		}
 		if respProto.PartialSuccess != nil && respProto.PartialSuccess.RejectedDataPoints > 0 {
-			errMsg := fmt.Sprintf("OTEL rejected %d data points: %s",
+			o.logger.Printf("ERROR: OTEL rejected %d data points: %s",
 				respProto.PartialSuccess.RejectedDataPoints,
 				respProto.PartialSuccess.ErrorMessage)
-			o.logger.Printf("ERROR: %s", errMsg)
 			if cfg.EnableMetrics {
 				otlpRejectedDataPoints.WithLabelValues(cfg.Name).Add(float64(respProto.PartialSuccess.RejectedDataPoints))
 			}
-			return errors.New(errMsg)
+			return &partialSuccessError{
+				rejected:     respProto.PartialSuccess.RejectedDataPoints,
+				errorMessage: respProto.PartialSuccess.ErrorMessage,
+			}
 		}
 		return nil
 	}
