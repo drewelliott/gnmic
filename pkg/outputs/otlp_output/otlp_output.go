@@ -203,7 +203,7 @@ func (o *otlpOutput) initFields() {
 
 // loadCfg returns the currently-published config, or nil if state was never
 // stored. Centralizing the deref protects against a nil state.Load() in
-// places (String, registerMetrics) that may be called pre-Init in tests.
+// places (such as String) that may be called pre-Init in tests.
 func (o *otlpOutput) loadCfg() *config {
 	if s := o.state.Load(); s != nil {
 		return s.cfg
@@ -283,23 +283,13 @@ func (o *otlpOutput) Init(ctx context.Context, name string, cfg map[string]inter
 		o.logger.SetFlags(options.Logger.Flags())
 	}
 
-	// Build and publish the initial outputState (cfg + transport) atomically.
-	// Note: registerMetrics needs cfg.EnableMetrics to be visible, so we
-	// publish state BEFORE calling registerMetrics.
-	state, err := o.buildOutputState(ncfg)
-	if err != nil {
-		return err
-	}
-	o.state.Store(state)
-
-	// Initialize registry
+	// Initialize registry and register metrics (no transport open yet).
 	o.reg = options.Registry
-	err = o.registerMetrics()
-	if err != nil {
+	if err := o.registerMetrics(ncfg); err != nil {
 		return err
 	}
 
-	// Initialize event processors
+	// Build event processors (no transport open yet).
 	dc := new(dynConfig)
 	dc.evps, err = o.buildEventProcessors(ncfg)
 	if err != nil {
@@ -307,7 +297,16 @@ func (o *otlpOutput) Init(ctx context.Context, name string, cfg map[string]inter
 	}
 	o.dynCfg.Store(dc)
 
-	// Initialize worker channels
+	// Build and publish the outputState (cfg + transport). This is the last
+	// resource-allocating step that can fail; if buildOutputState succeeds,
+	// Init succeeds (worker startup below cannot fail).
+	state, err := o.buildOutputState(ncfg)
+	if err != nil {
+		return err
+	}
+	o.state.Store(state)
+
+	// Initialize worker channels and start workers.
 	eventCh := make(chan *formatters.EventMsg, ncfg.BufferSize)
 	o.eventCh.Store(&eventCh)
 
@@ -822,12 +821,8 @@ func (o *otlpOutput) createTLSConfigFor(cfg *config) (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
-func (o *otlpOutput) registerMetrics() error {
-	cfg := o.loadCfg()
-	// cfg == nil is unreachable from production: registerMetrics is called only
-	// from Init, which Stores a non-nil state before this call. The guard makes
-	// the function safe for any pre-Init test path. See Appendix D.
-	if cfg == nil || !cfg.EnableMetrics {
+func (o *otlpOutput) registerMetrics(cfg *config) error {
+	if !cfg.EnableMetrics {
 		return nil
 	}
 
