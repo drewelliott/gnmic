@@ -456,14 +456,18 @@ func TestSendHTTP_SuccessfulExport(t *testing.T) {
 // publishes a new outputState carrying the same transport pointers.
 // Test-only convenience — production reloads via Update(). Direct mutation
 // of state.Load().cfg is an unsynchronized write that defeats atomic.Pointer;
-// this helper does it safely.
+// this helper does it safely. Note: outputState contains a sync.WaitGroup
+// (noCopy), so we field-copy explicitly rather than dereferencing.
 func withCfg(o *otlpOutput, mutate func(*config)) {
 	oldState := o.state.Load()
 	cfg := *oldState.cfg
 	mutate(&cfg)
-	newState := *oldState // shallow copy preserves transport pointers
-	newState.cfg = &cfg
-	o.state.Store(&newState)
+	newState := &outputState{
+		cfg:       &cfg,
+		grpcState: oldState.grpcState,
+		httpState: oldState.httpState,
+	}
+	o.state.Store(newState)
 }
 
 // newHTTPTestOutput is shared by every test that drives sendHTTP through a real
@@ -1262,4 +1266,84 @@ func TestIsPartialSuccessError(t *testing.T) {
 	require.False(t, isPartialSuccessError(nil))
 	// httpExportError must NOT match — it's a different category.
 	require.False(t, isPartialSuccessError(&httpExportError{status: 503}))
+}
+
+// Decision-path: an in-flight batch holding the OLD outputState must be able
+// to finish even if Update swaps to a new state mid-flight. Under the wall-
+// clock heuristic this would have dropped batches whose lifetime exceeded the
+// fixed 60s window. Under the WaitGroup model, cleanup waits for actual users.
+func TestUpdate_TransportNotClosedWhileBatchInFlight(t *testing.T) {
+	// Server intentionally hangs on the first request (simulates a slow
+	// upstream). The hang is released by closing 'release' from the test.
+	release := make(chan struct{})
+	var hangCount atomic.Int32
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if hangCount.Add(1) == 1 {
+			<-release
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	withCfg(o, func(c *config) {
+		c.Timeout = 10 * time.Second // generous so the hang can persist
+	})
+
+	// Start an in-flight sendHTTP via sendBatch. Use a goroutine so the
+	// caller doesn't block on the server hang.
+	state := o.state.Load()
+	state.inFlight.Add(1)
+	sendDone := make(chan error, 1)
+	go func() {
+		defer state.inFlight.Done()
+		sendDone <- o.sendHTTP(context.Background(), state, &metricsv1.ExportMetricsServiceRequest{})
+	}()
+
+	// Wait until the server has received the request (so the goroutine is
+	// actually mid-send and holding the state reference).
+	require.Eventually(t, func() bool { return hangCount.Load() == 1 },
+		2*time.Second, 25*time.Millisecond, "server should receive the first request")
+
+	// Simulate a transport-rebuild reload by manually publishing a new state.
+	// This mirrors what Update's rebuild path does: build new state, lock-
+	// Swap-unlock, async Wait+cleanup.
+	newCfg := *o.state.Load().cfg
+	newHS, err := o.initHTTPFor(&newCfg)
+	require.NoError(t, err)
+	newState := &outputState{cfg: &newCfg, httpState: newHS}
+
+	o.stateMu.Lock()
+	oldState := o.state.Swap(newState)
+	o.stateMu.Unlock()
+
+	// Track when cleanup actually fires.
+	cleanupDone := make(chan struct{})
+	go func() {
+		oldState.inFlight.Wait()
+		oldState.cleanup()
+		close(cleanupDone)
+	}()
+
+	// Critical: cleanupDone must NOT have fired yet — the in-flight goroutine
+	// is still hung on the server response. The 100ms window is comfortably
+	// shorter than the test's 2s overall budget.
+	select {
+	case <-cleanupDone:
+		t.Fatal("cleanup fired while batch was still in-flight — would close the transport under it")
+	case <-time.After(100 * time.Millisecond):
+		// expected: cleanup is still waiting
+	}
+
+	// Release the server hang. The goroutine completes, inFlight drains to
+	// zero, cleanup fires.
+	close(release)
+	require.NoError(t, <-sendDone, "in-flight send should complete after release")
+
+	select {
+	case <-cleanupDone:
+		// expected: cleanup fired once the WaitGroup drained
+	case <-time.After(2 * time.Second):
+		t.Fatal("cleanup never fired after the in-flight batch completed")
+	}
 }
