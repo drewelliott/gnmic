@@ -381,6 +381,9 @@ func (o *otlpOutput) Update(ctx context.Context, cfg map[string]any) error {
 		time.AfterFunc(60*time.Second, oldState.cleanup)
 	} else {
 		// Cfg-only change. Share transport pointers with the previous state.
+		// The nil-currState case is structurally unreachable here:
+		// needsTransportRebuild(nil, X) returns true, so we'd be in the if-branch
+		// above. The guard below is belt-and-suspenders. See Appendix D.
 		newState := &outputState{cfg: newCfg}
 		if currState != nil {
 			newState.grpcState = currState.grpcState
@@ -821,6 +824,9 @@ func (o *otlpOutput) createTLSConfigFor(cfg *config) (*tls.Config, error) {
 
 func (o *otlpOutput) registerMetrics() error {
 	cfg := o.loadCfg()
+	// cfg == nil is unreachable from production: registerMetrics is called only
+	// from Init, which Stores a non-nil state before this call. The guard makes
+	// the function safe for any pre-Init test path. See Appendix D.
 	if cfg == nil || !cfg.EnableMetrics {
 		return nil
 	}
