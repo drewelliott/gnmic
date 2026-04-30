@@ -786,32 +786,84 @@ func TestSendHTTP_PermanentErrorStopsRetryLoop(t *testing.T) {
 }
 
 // Table-driven decision-path coverage for effectiveRetrySleep.
+//
+// gRPC and the Retry-After-honoring path are deterministic — assert exact
+// values. The HTTP no-Retry-After path uses exponential backoff with full
+// jitter, so we assert the result lies in the canonical [0, base) range
+// where base = min(maxSleep, 2^attempt * 100ms).
 func TestEffectiveRetrySleep_Table(t *testing.T) {
 	const testCap = 30 * time.Second
+
+	type bound struct {
+		min, max time.Duration // inclusive lower, exclusive upper
+	}
 	cases := []struct {
 		name       string
 		protocol   string
 		attempt    int
 		retryAfter time.Duration
-		want       time.Duration
+		// Exactly one of `want` or `bound` must be set.
+		want  time.Duration
+		bound *bound
 	}{
-		{"grpc_attempt0_no_retry_after", "grpc", 0, 0, 100 * time.Millisecond},
-		{"grpc_attempt2_no_retry_after", "grpc", 2, 0, 300 * time.Millisecond},
-		{"grpc_ignores_retry_after", "grpc", 0, 5 * time.Second, 100 * time.Millisecond},
-		{"http_attempt0_no_retry_after", "http", 0, 0, 100 * time.Millisecond},
-		{"http_attempt1_falls_back_to_backoff", "http", 1, 0, 200 * time.Millisecond},
-		{"http_zero_retry_after_falls_back", "http", 0, 0, 100 * time.Millisecond},
-		{"http_negative_retry_after_falls_back", "http", 0, -time.Second, 100 * time.Millisecond},
-		{"http_retry_after_under_cap_used", "http", 0, 5 * time.Second, 5 * time.Second},
-		{"http_retry_after_at_cap_used", "http", 0, testCap, testCap},
-		{"http_retry_after_above_cap_clamped", "http", 0, 5 * time.Minute, testCap},
+		// gRPC: deterministic linear backoff regardless of Retry-After.
+		{name: "grpc_attempt0_no_retry_after", protocol: "grpc", attempt: 0, retryAfter: 0, want: 100 * time.Millisecond},
+		{name: "grpc_attempt2_no_retry_after", protocol: "grpc", attempt: 2, retryAfter: 0, want: 300 * time.Millisecond},
+		{name: "grpc_ignores_retry_after", protocol: "grpc", attempt: 0, retryAfter: 5 * time.Second, want: 100 * time.Millisecond},
+
+		// HTTP with Retry-After: deterministic.
+		{name: "http_retry_after_under_cap_used", protocol: "http", attempt: 0, retryAfter: 5 * time.Second, want: 5 * time.Second},
+		{name: "http_retry_after_at_cap_used", protocol: "http", attempt: 0, retryAfter: testCap, want: testCap},
+		{name: "http_retry_after_above_cap_clamped", protocol: "http", attempt: 0, retryAfter: 5 * time.Minute, want: testCap},
+
+		// HTTP without Retry-After: exponential backoff with full jitter — assert range.
+		// base for attempt=0 is 100ms, attempt=1 is 200ms, attempt=2 is 400ms.
+		{name: "http_attempt0_no_retry_after", protocol: "http", attempt: 0, retryAfter: 0, bound: &bound{0, 100 * time.Millisecond}},
+		{name: "http_attempt1_no_retry_after", protocol: "http", attempt: 1, retryAfter: 0, bound: &bound{0, 200 * time.Millisecond}},
+		{name: "http_attempt2_no_retry_after", protocol: "http", attempt: 2, retryAfter: 0, bound: &bound{0, 400 * time.Millisecond}},
+		{name: "http_zero_retry_after_falls_back", protocol: "http", attempt: 0, retryAfter: 0, bound: &bound{0, 100 * time.Millisecond}},
+		{name: "http_negative_retry_after_falls_back", protocol: "http", attempt: 0, retryAfter: -time.Second, bound: &bound{0, 100 * time.Millisecond}},
+		// Large attempt: base saturates at maxSleep cap. 2^9 * 100ms = 51.2s > 30s cap → bound is [0, testCap).
+		{name: "http_high_attempt_clamped_to_cap", protocol: "http", attempt: 9, retryAfter: 0, bound: &bound{0, testCap}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := effectiveRetrySleep(tc.protocol, tc.attempt, tc.retryAfter, testCap)
+			if tc.bound != nil {
+				require.GreaterOrEqual(t, got, tc.bound.min, "jitter lower bound")
+				require.Less(t, got, tc.bound.max, "jitter exclusive upper bound")
+				return
+			}
 			require.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// Statistical sanity for full-jitter distribution: many samples must span the
+// [0, base) range (not all clustered near zero or near base). 100 samples is
+// sufficient to detect a stuck PRNG without making the test flaky.
+func TestEffectiveRetrySleep_JitterDistribution(t *testing.T) {
+	const testCap = 30 * time.Second
+	const samples = 100
+	const attempt = 4 // base = 1.6s; plenty of room for the distribution to spread
+
+	base := time.Duration(1<<attempt) * 100 * time.Millisecond
+	var minSeen, maxSeen time.Duration = base, 0
+	for i := 0; i < samples; i++ {
+		got := effectiveRetrySleep("http", attempt, 0, testCap)
+		require.GreaterOrEqual(t, got, time.Duration(0))
+		require.Less(t, got, base)
+		if got < minSeen {
+			minSeen = got
+		}
+		if got > maxSeen {
+			maxSeen = got
+		}
+	}
+	// Across 100 samples we expect to see at least the lower 25% and upper 25%
+	// of the range. If the PRNG is stuck this fails loudly.
+	require.Less(t, minSeen, base/4, "samples should span the lower quartile")
+	require.Greater(t, maxSeen, base*3/4, "samples should span the upper quartile")
 }
 
 // Decision-path: retryAfterFromError must return 0 for plain (non-typed) errors.

@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	rand "math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -352,21 +353,38 @@ func retryAfterFromError(err error) time.Duration {
 // effectiveRetrySleep computes how long the retry loop should sleep before the
 // next attempt, given the protocol, attempt index, server-supplied Retry-After
 // hint, and our configured maxSleep cap. Extracted so the cap branch is
-// unit-testable without 30-second sleeps in tests.
+// unit-testable without long sleeps in tests.
 //
-// gRPC: always linear backoff (attempt+1) * 100ms. Retry-After is ignored.
-// HTTP: Retry-After (capped at maxSleep) overrides linear backoff when > 0,
+// gRPC: linear backoff (attempt+1) * 100ms. Retry-After is ignored. (Decision 2 —
+// HTTP-only spec compliance; a gRPC retry overhaul is separate work.)
 //
-//	otherwise falls back to the same linear backoff.
+// HTTP, server-supplied Retry-After present (>0): use it, capped at maxSleep.
+// HTTP, no Retry-After: exponential backoff with full jitter per OTLP spec
+// (https://opentelemetry.io/docs/specs/otlp/) — base = min(maxSleep, 2^attempt * 100ms),
+// sleep = random in [0, base) per AWS's 2015 "Exponential Backoff And Jitter".
 //
 // Param `maxSleep` is named so to avoid shadowing the `cap` builtin.
 func effectiveRetrySleep(protocol string, attempt int, retryAfter, maxSleep time.Duration) time.Duration {
-	backoff := time.Duration(attempt+1) * 100 * time.Millisecond
-	if protocol != "http" || retryAfter <= 0 {
-		return backoff
+	// Server-supplied Retry-After always wins (HTTP only).
+	if protocol == "http" && retryAfter > 0 {
+		if retryAfter > maxSleep {
+			return maxSleep
+		}
+		return retryAfter
 	}
-	if retryAfter > maxSleep {
-		return maxSleep
+	// gRPC: linear backoff.
+	if protocol != "http" {
+		return time.Duration(attempt+1) * 100 * time.Millisecond
 	}
-	return retryAfter
+	// HTTP: exponential backoff with full jitter, per OTLP spec.
+	// Cap the exponent to avoid 1<<attempt overflow on pathological MaxRetries.
+	exp := attempt
+	if exp > 30 {
+		exp = 30
+	}
+	base := time.Duration(1<<exp) * 100 * time.Millisecond
+	if base <= 0 || base > maxSleep {
+		base = maxSleep
+	}
+	return time.Duration(rand.Int64N(int64(base))) // [0, base) — canonical AWS full-jitter
 }
