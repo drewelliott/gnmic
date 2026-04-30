@@ -200,7 +200,7 @@ When `enable-metrics` is set to `true`, the OTLP output exposes the following Pr
 
 For backends that expose only OTLP/HTTP (such as NVIDIA Panoptes), set `protocol: http` and provide client certificates in the `tls` block.
 
-The `endpoint:` field accepts either a bare `host:port` or a full URL. With a bare value, the scheme is inferred from the presence of the `tls:` block (`https` if present, `http` otherwise) and the path defaults to `/v1/metrics`. With a full URL, scheme and path are honored verbatim — but mixing `http://` with a populated `tls:` block is rejected at startup, since that combination silently disables mTLS.
+The `endpoint:` field accepts either a bare `host:port` or a full URL. With a bare value, the scheme is inferred from the presence of the `tls:` block (`https` if present, `http` otherwise) and the path defaults to `/v1/metrics`. With a full URL, the scheme is honored verbatim; the path is honored if specified, or defaults to `/v1/metrics` if absent or `/` (matching the `OTEL_EXPORTER_OTLP_ENDPOINT` convention used by upstream OpenTelemetry SDKs). Only `http` and `https` schemes are accepted; mixing `http://` with a populated `tls:` block is rejected at startup, since that combination silently disables mTLS.
 
 ### External endpoint (public DNS)
 
