@@ -426,10 +426,10 @@ func (o *otlpOutput) Update(ctx context.Context, cfg map[string]any) error {
 	} else {
 		// Cfg-only change. Share the *transportState pointer with the
 		// previous state so a single inFlight WaitGroup tracks every batch
-		// using this transport across all config-only reloads. The
-		// nil-currState case is structurally unreachable here:
-		// needsTransportRebuild(nil, X) returns true, so we'd be in the if-branch
-		// above. The guard below is belt-and-suspenders. See Appendix D.
+		// using this transport across all config-only reloads.
+		// nil-currState is unreachable in practice (needsTransportRebuild
+		// returns true on nil, taking the rebuild branch above); the guard
+		// below is defensive.
 		newState := &outputState{cfg: newCfg}
 		if currState != nil {
 			newState.transport = currState.transport
