@@ -34,7 +34,7 @@ var stringsBuilderPool = sync.Pool{
 
 // convertToOTLP converts gNMI EventMsg slice to OTLP ExportMetricsServiceRequest
 func (o *otlpOutput) convertToOTLP(events []*formatters.EventMsg) *metricsv1.ExportMetricsServiceRequest {
-	cfg := o.cfg.Load()
+	cfg := o.loadCfg()
 
 	if cfg.Debug {
 		o.logger.Printf("DEBUG: convertToOTLP called with %d events", len(events))
@@ -447,11 +447,14 @@ func (o *otlpOutput) validateMetricData(rmIdx, smIdx, mIdx int, m *metricspb.Met
 }
 
 // sendGRPC sends the OTLP metrics via gRPC
-func (o *otlpOutput) sendGRPC(ctx context.Context, req *metricsv1.ExportMetricsServiceRequest) error {
-	cfg := o.cfg.Load()
-	gs := o.grpcState.Load()
+func (o *otlpOutput) sendGRPC(ctx context.Context, state *outputState, req *metricsv1.ExportMetricsServiceRequest) error {
+	cfg := state.cfg
+	gs := state.grpcState
 
 	if gs == nil || gs.client == nil {
+		// Belt-and-suspenders: when Protocol == "grpc", buildOutputState
+		// guarantees grpcState is populated. See sendHTTP for the same
+		// rationale.
 		return fmt.Errorf("gRPC client not initialized")
 	}
 

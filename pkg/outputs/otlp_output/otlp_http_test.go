@@ -254,15 +254,22 @@ func TestResolveMetricsURL(t *testing.T) {
 	}
 }
 
+// newInitHTTPHelperOutput is a tiny helper for tests that exercise initHTTPFor
+// directly (no transport publication required). Keeps test bodies short.
+func newInitHTTPHelperOutput() *otlpOutput {
+	o := &otlpOutput{}
+	o.state = new(atomic.Pointer[outputState])
+	o.logger = log.New(io.Discard, "", 0)
+	return o
+}
+
 func TestInitHTTPFor_WithMTLS(t *testing.T) {
 	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 	defer srv.Close()
 
-	o := &otlpOutput{}
-	o.cfg = new(atomic.Pointer[config])
-	o.logger = log.New(io.Discard, "", 0)
+	o := newInitHTTPHelperOutput()
 	cfg := &config{
 		Endpoint: srv.URL, // full https URL from httptest
 		Protocol: "http",
@@ -273,7 +280,6 @@ func TestInitHTTPFor_WithMTLS(t *testing.T) {
 		},
 		Headers: map[string]string{"X-Scope-OrgID": "tenant-1"},
 	}
-	o.cfg.Store(cfg)
 
 	hs, err := o.initHTTPFor(cfg)
 	require.NoError(t, err)
@@ -285,11 +291,8 @@ func TestInitHTTPFor_WithMTLS(t *testing.T) {
 }
 
 func TestInitHTTPFor_NoTLSBlock(t *testing.T) {
-	o := &otlpOutput{}
-	o.cfg = new(atomic.Pointer[config])
-	o.logger = log.New(io.Discard, "", 0)
+	o := newInitHTTPHelperOutput()
 	cfg := &config{Endpoint: "localhost:4318", Protocol: "http"}
-	o.cfg.Store(cfg)
 
 	hs, err := o.initHTTPFor(cfg)
 	require.NoError(t, err)
@@ -299,15 +302,12 @@ func TestInitHTTPFor_NoTLSBlock(t *testing.T) {
 // Strict-coherence guard: configuring TLS while pinning a plaintext URL is
 // almost always a misconfiguration that silently disables mTLS. Reject at Init.
 func TestInitHTTPFor_PlaintextURLWithTLSBlockErrors(t *testing.T) {
-	o := &otlpOutput{}
-	o.cfg = new(atomic.Pointer[config])
-	o.logger = log.New(io.Discard, "", 0)
+	o := newInitHTTPHelperOutput()
 	cfg := &config{
 		Endpoint: "http://panoptes.observability.svc:4318",
 		Protocol: "http",
 		TLS:      &types.TLSConfig{CaFile: "/some/ca.crt"},
 	}
-	o.cfg.Store(cfg)
 
 	_, err := o.initHTTPFor(cfg)
 	require.Error(t, err, "must reject http:// URL when tls block is configured")
@@ -316,11 +316,8 @@ func TestInitHTTPFor_PlaintextURLWithTLSBlockErrors(t *testing.T) {
 
 // Mirror case stays permissive: https:// URL with no tls block uses system roots.
 func TestInitHTTPFor_HTTPSURLWithoutTLSBlockAllowed(t *testing.T) {
-	o := &otlpOutput{}
-	o.cfg = new(atomic.Pointer[config])
-	o.logger = log.New(io.Discard, "", 0)
+	o := newInitHTTPHelperOutput()
 	cfg := &config{Endpoint: "https://panoptes.example.com/v1/metrics", Protocol: "http"}
-	o.cfg.Store(cfg)
 
 	hs, err := o.initHTTPFor(cfg)
 	require.NoError(t, err)
@@ -329,9 +326,7 @@ func TestInitHTTPFor_HTTPSURLWithoutTLSBlockAllowed(t *testing.T) {
 
 // Decision-path: createTLSConfigFor failure must propagate as a clear Init error.
 func TestInitHTTPFor_TLSCreateFails(t *testing.T) {
-	o := &otlpOutput{}
-	o.cfg = new(atomic.Pointer[config])
-	o.logger = log.New(io.Discard, "", 0)
+	o := newInitHTTPHelperOutput()
 	cfg := &config{
 		Endpoint: "https://panoptes.example.com:4318",
 		Protocol: "http",
@@ -341,7 +336,6 @@ func TestInitHTTPFor_TLSCreateFails(t *testing.T) {
 			KeyFile:  "/nonexistent/path/client.key",
 		},
 	}
-	o.cfg.Store(cfg)
 
 	_, err := o.initHTTPFor(cfg)
 	require.Error(t, err)
@@ -350,11 +344,8 @@ func TestInitHTTPFor_TLSCreateFails(t *testing.T) {
 
 // Decision-path: empty endpoint reaching resolveMetricsURL must surface as Init error.
 func TestInitHTTPFor_EmptyEndpointErrors(t *testing.T) {
-	o := &otlpOutput{}
-	o.cfg = new(atomic.Pointer[config])
-	o.logger = log.New(io.Discard, "", 0)
+	o := newInitHTTPHelperOutput()
 	cfg := &config{Endpoint: "", Protocol: "http"}
-	o.cfg.Store(cfg)
 
 	_, err := o.initHTTPFor(cfg)
 	require.Error(t, err)
@@ -376,8 +367,7 @@ func TestSendHTTP_SuccessfulExport(t *testing.T) {
 	defer srv.Close()
 
 	o := &otlpOutput{}
-	o.cfg = new(atomic.Pointer[config])
-	o.httpState = new(atomic.Pointer[httpClientState])
+	o.state = new(atomic.Pointer[outputState])
 	o.logger = log.New(io.Discard, "", 0)
 
 	cfg := &config{
@@ -391,15 +381,14 @@ func TestSendHTTP_SuccessfulExport(t *testing.T) {
 		},
 		Headers: map[string]string{"X-Scope-OrgID": "tenant-1"},
 	}
-	o.cfg.Store(cfg)
 
 	hs, err := o.initHTTPFor(cfg)
 	require.NoError(t, err)
-	o.httpState.Store(hs)
+	o.state.Store(&outputState{cfg: cfg, httpState: hs})
 
 	// Minimal valid ExportMetricsServiceRequest.
 	req := &metricsv1.ExportMetricsServiceRequest{}
-	require.NoError(t, o.sendHTTP(context.Background(), req))
+	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), req))
 
 	require.Equal(t, "application/x-protobuf", gotContentType)
 	require.Equal(t, "tenant-1", gotOrgID)
@@ -410,13 +399,17 @@ func TestSendHTTP_SuccessfulExport(t *testing.T) {
 }
 
 // withCfg applies a mutation to a copy of the current config and atomically
-// swaps it back. Test-only convenience — production reloads via Update().
-// Direct mutation of o.cfg.Load() (e.g. `o.cfg.Load().Timeout = 0`) is an
-// unsynchronized write that defeats atomic.Pointer; this helper does it safely.
+// publishes a new outputState carrying the same transport pointers.
+// Test-only convenience — production reloads via Update(). Direct mutation
+// of state.Load().cfg is an unsynchronized write that defeats atomic.Pointer;
+// this helper does it safely.
 func withCfg(o *otlpOutput, mutate func(*config)) {
-	cfg := *o.cfg.Load()
+	oldState := o.state.Load()
+	cfg := *oldState.cfg
 	mutate(&cfg)
-	o.cfg.Store(&cfg)
+	newState := *oldState // shallow copy preserves transport pointers
+	newState.cfg = &cfg
+	o.state.Store(&newState)
 }
 
 // newHTTPTestOutput is shared by every test that drives sendHTTP through a real
@@ -425,8 +418,7 @@ func withCfg(o *otlpOutput, mutate func(*config)) {
 func newHTTPTestOutput(t *testing.T, srv *mTLSTestServer) *otlpOutput {
 	t.Helper()
 	o := &otlpOutput{}
-	o.cfg = new(atomic.Pointer[config])
-	o.httpState = new(atomic.Pointer[httpClientState])
+	o.state = new(atomic.Pointer[outputState])
 	o.logger = log.New(io.Discard, "", 0)
 	cfg := &config{
 		Endpoint: srv.URL,
@@ -438,22 +430,24 @@ func newHTTPTestOutput(t *testing.T, srv *mTLSTestServer) *otlpOutput {
 			KeyFile:  srv.ClientKeyPath(),
 		},
 	}
-	o.cfg.Store(cfg)
 	hs, err := o.initHTTPFor(cfg)
 	require.NoError(t, err)
-	o.httpState.Store(hs)
+	o.state.Store(&outputState{cfg: cfg, httpState: hs})
 	return o
 }
 
 // Decision-path: defensive guard for "Init never ran or partially failed".
+// Constructs an outputState with cfg.Protocol == "http" but no httpState —
+// exactly the shape that would be invalid in production but possible from
+// hand-built test scaffolding.
 func TestSendHTTP_NoStateInitialized(t *testing.T) {
 	o := &otlpOutput{}
-	o.cfg = new(atomic.Pointer[config])
-	o.httpState = new(atomic.Pointer[httpClientState]) // never Stored
+	o.state = new(atomic.Pointer[outputState])
 	o.logger = log.New(io.Discard, "", 0)
-	o.cfg.Store(&config{Protocol: "http", Endpoint: "https://x"})
+	state := &outputState{cfg: &config{Protocol: "http", Endpoint: "https://x"}}
+	o.state.Store(state)
 
-	err := o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{})
+	err := o.sendHTTP(context.Background(), state, &metricsv1.ExportMetricsServiceRequest{})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "not initialized")
 }
@@ -470,7 +464,7 @@ func TestSendHTTP_NoTimeoutConfigured(t *testing.T) {
 	o := newHTTPTestOutput(t, srv)
 	withCfg(o, func(c *config) { c.Timeout = 0 })
 
-	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{}))
 }
 
 // Decision-path: client.Do failure (transport error). Stop the server first so
@@ -481,7 +475,7 @@ func TestSendHTTP_DialFailure(t *testing.T) {
 	o := newHTTPTestOutput(t, srv)
 	srv.Close() // close before the call so dial fails
 
-	err := o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{})
+	err := o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{})
 	require.Error(t, err)
 }
 
@@ -509,7 +503,7 @@ func TestSendHTTP_MarshalRejectsInvalidUTF8(t *testing.T) {
 			},
 		},
 	}
-	err := o.sendHTTP(context.Background(), req)
+	err := o.sendHTTP(context.Background(), o.state.Load(), req)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "marshal OTLP request")
 }
@@ -563,7 +557,7 @@ func TestSendHTTP_PermanentErrorNotRetried(t *testing.T) {
 	defer srv.Close()
 
 	o := newHTTPTestOutput(t, srv)
-	err := o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{})
+	err := o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{})
 	require.Error(t, err)
 	require.True(t, isPermanentHTTPError(err))
 	require.Equal(t, 1, calls, "sendHTTP itself should not retry")
@@ -576,7 +570,7 @@ func TestSendHTTP_RetryableError(t *testing.T) {
 	defer srv.Close()
 
 	o := newHTTPTestOutput(t, srv)
-	err := o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{})
+	err := o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{})
 	require.Error(t, err)
 	require.False(t, isPermanentHTTPError(err))
 }
@@ -630,7 +624,7 @@ func TestSendHTTP_PartialSuccessReturnsError(t *testing.T) {
 	defer srv.Close()
 
 	o := newHTTPTestOutput(t, srv)
-	err := o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{})
+	err := o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{})
 	require.Error(t, err, "PartialSuccess with rejected points must surface as an error (parity with gRPC)")
 	require.Contains(t, err.Error(), "rejected 7")
 }
@@ -654,7 +648,7 @@ func TestSendHTTP_PartialSuccessZeroRejected(t *testing.T) {
 	defer srv.Close()
 
 	o := newHTTPTestOutput(t, srv)
-	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{}))
 }
 
 // Decision-path: empty 200 body must succeed (the early-return short-circuit).
@@ -665,7 +659,7 @@ func TestSendHTTP_EmptyResponseBody(t *testing.T) {
 	defer srv.Close()
 
 	o := newHTTPTestOutput(t, srv)
-	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{}))
 }
 
 // Decision-path (debug off): malformed (non-protobuf) 200 body must NOT cause
@@ -679,8 +673,8 @@ func TestSendHTTP_MalformedResponseBody_DebugOff(t *testing.T) {
 	defer srv.Close()
 
 	o := newHTTPTestOutput(t, srv)
-	require.False(t, o.cfg.Load().Debug, "precondition: debug must be off for this variant")
-	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.False(t, o.state.Load().cfg.Debug, "precondition: debug must be off for this variant")
+	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{}))
 }
 
 // Decision-path (debug on): same scenario but Debug enabled — exercises the
@@ -698,7 +692,7 @@ func TestSendHTTP_MalformedResponseBody_DebugOn(t *testing.T) {
 	o.logger = log.New(&logbuf, "", 0)
 	withCfg(o, func(c *config) { c.Debug = true })
 
-	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{}))
 	require.Contains(t, logbuf.String(), "failed to unmarshal OTLP response body")
 }
 
@@ -725,9 +719,9 @@ func TestSendHTTP_PartialSuccessIncrementsMetric(t *testing.T) {
 		c.Name = "test-metric-output"
 	})
 
-	cfgName := o.cfg.Load().Name
+	cfgName := o.state.Load().cfg.Name
 	before := testutil.ToFloat64(otlpRejectedDataPoints.WithLabelValues(cfgName))
-	err := o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{})
+	err := o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{})
 	require.Error(t, err)
 	after := testutil.ToFloat64(otlpRejectedDataPoints.WithLabelValues(cfgName))
 	require.Equal(t, float64(3), after-before, "metric must advance by RejectedDataPoints")
@@ -1019,11 +1013,12 @@ func TestSendHTTP_GzipCompression(t *testing.T) {
 
 	o := newHTTPTestOutput(t, srv)
 	withCfg(o, func(c *config) { c.Compression = "gzip" })
-	hs, err := o.initHTTPFor(o.cfg.Load())
+	cfg := o.state.Load().cfg
+	hs, err := o.initHTTPFor(cfg)
 	require.NoError(t, err)
-	o.httpState.Store(hs)
+	o.state.Store(&outputState{cfg: cfg, httpState: hs})
 
-	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{}))
 	require.Equal(t, "gzip", gotEncoding)
 
 	var roundtrip metricsv1.ExportMetricsServiceRequest
@@ -1059,8 +1054,8 @@ func TestSendHTTP_GzipIsDefaultForHTTP(t *testing.T) {
 	))
 	defer o.Close()
 
-	require.Equal(t, "gzip", o.cfg.Load().Compression, "default must populate Compression for http")
-	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.Equal(t, "gzip", o.state.Load().cfg.Compression, "default must populate Compression for http")
+	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{}))
 	require.Equal(t, "gzip", gotEncoding)
 }
 
@@ -1091,7 +1086,7 @@ func TestSendHTTP_CompressionNoneOptOut(t *testing.T) {
 	))
 	defer o.Close()
 
-	require.NoError(t, o.sendHTTP(context.Background(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{}))
 	require.Equal(t, "", gotEncoding, "compression: none must produce no Content-Encoding header")
 }
 

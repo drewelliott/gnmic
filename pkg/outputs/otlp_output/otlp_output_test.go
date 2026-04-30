@@ -46,8 +46,8 @@ func newTestOutput(cfg *config) *otlpOutput {
 		cfg.counterRegexes = append(cfg.counterRegexes, regexp.MustCompile(p))
 	}
 	o := &otlpOutput{}
-	o.cfg = new(atomic.Pointer[config])
-	o.cfg.Store(cfg)
+	o.state = new(atomic.Pointer[outputState])
+	o.state.Store(&outputState{cfg: cfg})
 	o.logger = log.New(io.Discard, "", 0)
 	return o
 }
@@ -731,7 +731,9 @@ func TestOTLP_InitSucceedsWithUnreachableEndpoint(t *testing.T) {
 	)
 	assert.NoError(t, err, "Init should succeed even with unreachable endpoint")
 
-	gs := output.grpcState.Load()
+	state := output.state.Load()
+	require.NotNil(t, state, "outputState should be created")
+	gs := state.grpcState
 	assert.NotNil(t, gs, "gRPC state should be created")
 	assert.NotNil(t, gs.conn, "gRPC connection should be created")
 	assert.NotNil(t, gs.client, "gRPC client should be created")

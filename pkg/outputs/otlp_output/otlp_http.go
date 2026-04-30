@@ -238,11 +238,16 @@ func (o *otlpOutput) initHTTPFor(cfg *config) (*httpClientState, error) {
 	return &httpClientState{client: client, endpoint: resolvedURL, headers: hdr}, nil
 }
 
-func (o *otlpOutput) sendHTTP(ctx context.Context, req *metricsv1.ExportMetricsServiceRequest) error {
-	hs := o.httpState.Load()
+func (o *otlpOutput) sendHTTP(ctx context.Context, state *outputState, req *metricsv1.ExportMetricsServiceRequest) error {
+	hs := state.httpState
 	if hs == nil {
+		// Belt-and-suspenders: when Protocol == "http", buildOutputState
+		// guarantees httpState is populated. This guard catches partial
+		// init (test scaffolding) and any future code path that publishes
+		// a state with mismatched protocol/transport.
 		return fmt.Errorf("HTTP client not initialized")
 	}
+	cfg := state.cfg
 
 	raw, err := proto.Marshal(req)
 	if err != nil {
@@ -252,7 +257,7 @@ func (o *otlpOutput) sendHTTP(ctx context.Context, req *metricsv1.ExportMetricsS
 	}
 
 	body := raw
-	useGzip := o.cfg.Load().Compression == "gzip"
+	useGzip := cfg.Compression == "gzip"
 	if useGzip {
 		var buf bytes.Buffer
 		gw := gzip.NewWriter(&buf)
@@ -267,7 +272,6 @@ func (o *otlpOutput) sendHTTP(ctx context.Context, req *metricsv1.ExportMetricsS
 		body = buf.Bytes()
 	}
 
-	cfg := o.cfg.Load()
 	if cfg.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, cfg.Timeout)
