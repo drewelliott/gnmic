@@ -264,14 +264,20 @@ func newInitHTTPHelperOutput() *otlpOutput {
 }
 
 func TestInitHTTPFor_WithMTLS(t *testing.T) {
+	var (
+		gotContentType string
+		gotOrgID       string
+	)
 	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotContentType = r.Header.Get("Content-Type")
+		gotOrgID = r.Header.Get("X-Scope-OrgID")
 		w.WriteHeader(http.StatusOK)
 	})
 	defer srv.Close()
 
 	o := newInitHTTPHelperOutput()
 	cfg := &config{
-		Endpoint: srv.URL, // full https URL from httptest
+		Endpoint: srv.URL,
 		Protocol: "http",
 		TLS: &types.TLSConfig{
 			CaFile:   srv.CAPath(),
@@ -286,8 +292,12 @@ func TestInitHTTPFor_WithMTLS(t *testing.T) {
 	require.NotNil(t, hs)
 	require.NotNil(t, hs.client)
 	require.Contains(t, hs.endpoint, "/v1/metrics")
-	require.Equal(t, "application/x-protobuf", hs.headers.Get("Content-Type"))
-	require.Equal(t, "tenant-1", hs.headers.Get("X-Scope-OrgID"))
+
+	// Headers are built per-request now, so verify they arrive at the server.
+	o.state.Store(&outputState{cfg: cfg, httpState: hs})
+	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.Equal(t, "application/x-protobuf", gotContentType)
+	require.Equal(t, "tenant-1", gotOrgID)
 }
 
 func TestInitHTTPFor_NoTLSBlock(t *testing.T) {
@@ -350,6 +360,50 @@ func TestInitHTTPFor_EmptyEndpointErrors(t *testing.T) {
 	_, err := o.initHTTPFor(cfg)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "endpoint is required")
+}
+
+// Decision-path: a reload that changes only Headers must take effect on the
+// next batch without a transport rebuild. The old design cached headers in
+// httpClientState and silently ignored such reloads.
+func TestSendHTTP_HeaderReloadTakesEffect(t *testing.T) {
+	var gotOrgID string
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotOrgID = r.Header.Get("X-Scope-OrgID")
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	withCfg(o, func(c *config) {
+		c.Headers = map[string]string{"X-Scope-OrgID": "tenant-old"}
+	})
+	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.Equal(t, "tenant-old", gotOrgID)
+
+	// Simulate a header-only reload — same transport, new headers.
+	withCfg(o, func(c *config) {
+		c.Headers = map[string]string{"X-Scope-OrgID": "tenant-new"}
+	})
+	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.Equal(t, "tenant-new", gotOrgID, "header-only reload must take effect on the next batch")
+}
+
+// User-supplied headers cannot override the OTLP-required Content-Type or
+// (when compression is on) Content-Encoding. Document and enforce this contract.
+func TestSendHTTP_UserHeadersCannotOverrideProtocolHeaders(t *testing.T) {
+	var gotContentType string
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotContentType = r.Header.Get("Content-Type")
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	withCfg(o, func(c *config) {
+		c.Headers = map[string]string{"Content-Type": "application/json"} // bogus override attempt
+	})
+	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.Equal(t, "application/x-protobuf", gotContentType, "user Headers must not override Content-Type")
 }
 
 func TestSendHTTP_SuccessfulExport(t *testing.T) {

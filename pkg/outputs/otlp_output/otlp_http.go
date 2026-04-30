@@ -173,11 +173,13 @@ func resolveMetricsURL(endpoint string, tlsEnabled bool) (string, error) {
 
 // httpClientState is the transport-specific state for protocol: http.
 // Stored in an atomic.Pointer on otlpOutput so it can be swapped atomically
-// during live config reload.
+// during live config reload. Headers are built per-request in sendHTTP from
+// state.cfg.Headers — that way a reload that changes only the headers map
+// (e.g. tenant rotation) takes effect on the next batch without a transport
+// rebuild.
 type httpClientState struct {
 	client   *http.Client
 	endpoint string
-	headers  http.Header
 }
 
 func (o *otlpOutput) initHTTPFor(cfg *config) (*httpClientState, error) {
@@ -228,15 +230,8 @@ func (o *otlpOutput) initHTTPFor(cfg *config) (*httpClientState, error) {
 		return nil, err
 	}
 
-	hdr := http.Header{}
-	for k, v := range cfg.Headers {
-		hdr.Set(k, v)
-	}
-	hdr.Set("Content-Type", "application/x-protobuf")
-	// Compression header is set per-request in sendHTTP if compression is enabled.
-
 	o.logger.Printf("initialized OTLP HTTP client for endpoint: %s", resolvedURL)
-	return &httpClientState{client: client, endpoint: resolvedURL, headers: hdr}, nil
+	return &httpClientState{client: client, endpoint: resolvedURL}, nil
 }
 
 func (o *otlpOutput) sendHTTP(ctx context.Context, state *outputState, req *metricsv1.ExportMetricsServiceRequest) error {
@@ -285,7 +280,14 @@ func (o *otlpOutput) sendHTTP(ctx context.Context, state *outputState, req *metr
 		// method is a constant; body is a *bytes.Reader. See Appendix D.
 		return fmt.Errorf("build HTTP request: %w", err)
 	}
-	httpReq.Header = hs.headers.Clone()
+	// Build headers per-request from state.cfg so header-only reloads take effect
+	// on the next batch. User-supplied headers are set FIRST, then Content-Type
+	// and Content-Encoding are set last so the user can't accidentally override
+	// them via the headers map (preserving the OTLP wire format contract).
+	for k, v := range cfg.Headers {
+		httpReq.Header.Set(k, v)
+	}
+	httpReq.Header.Set("Content-Type", "application/x-protobuf")
 	if useGzip {
 		httpReq.Header.Set("Content-Encoding", "gzip")
 	}
