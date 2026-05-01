@@ -642,6 +642,7 @@ func (o *otlpOutput) Close() error {
 	oldState := o.state.Swap(nil)
 	o.stateMu.Unlock()
 	if oldState != nil {
+		oldState.transport.inFlight.Wait()
 		oldState.transport.cleanup()
 	}
 

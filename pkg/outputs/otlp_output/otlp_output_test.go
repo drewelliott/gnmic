@@ -1405,6 +1405,61 @@ func TestRegisterMetrics_PartialFailure_DoesNotRemoveExternallyOwnedCollectors(t
 	reg.Unregister(otlpSendDuration)
 }
 
+// TestClose_WaitsForInFlightBatchBeforeCleanup verifies that Close blocks on
+// transport.inFlight.Wait() before calling cleanup(). This ensures a future
+// sendBatch caller outside the worker path cannot observe a torn-down transport.
+func TestClose_WaitsForInFlightBatchBeforeCleanup(t *testing.T) {
+	server, endpoint := startMockOTLPServer(t)
+	defer server.Stop()
+
+	cfg := map[string]interface{}{
+		"endpoint":   endpoint,
+		"protocol":   "grpc",
+		"timeout":    "2s",
+		"batch-size": 1,
+		"interval":   "50ms",
+	}
+
+	o := &otlpOutput{}
+	require.NoError(t, o.Init(context.Background(), "test-close-inflight", cfg,
+		outputs.WithLogger(log.New(io.Discard, "", 0)),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	))
+
+	// Simulate an in-flight batch by manually incrementing inFlight under stateMu
+	// (the same protocol sendBatch uses).
+	o.stateMu.Lock()
+	state := o.state.Load()
+	state.transport.inFlight.Add(1)
+	o.stateMu.Unlock()
+
+	// Call Close in a goroutine; it should block on inFlight.Wait().
+	closeDone := make(chan struct{})
+	go func() {
+		defer close(closeDone)
+		o.Close()
+	}()
+
+	// Assert Close has NOT returned within 50 ms (it must be blocked on Wait).
+	select {
+	case <-closeDone:
+		t.Fatal("Close returned before inFlight was drained — Wait is not load-bearing")
+	case <-time.After(50 * time.Millisecond):
+		// expected: Close is still blocked
+	}
+
+	// Release the in-flight hold — Close must now proceed.
+	state.transport.inFlight.Done()
+
+	// Assert Close returns within 2 s.
+	select {
+	case <-closeDone:
+		// expected
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return within 2s after inFlight was drained")
+	}
+}
+
 // TestClose_UnregistersMetrics verifies that after a successful Init+Close cycle
 // the collectors are unregistered, so a subsequent Init does not hit a
 // duplicate-registration error.
