@@ -68,7 +68,7 @@ outputs:
 
 #### Output formats
 
-Different formats are supported for all outputs
+Some outputs support the generic `format` option:
 
 **Format/output** | **proto**                          | **protojson**                   |  **prototext**                      | **json**                       | **event**
 ----------------- | ---------------------------------- | --------------------------------| ------------------------------------|--------------------------------|--------------------------------:
