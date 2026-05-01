@@ -1,60 +1,62 @@
-`gnmic` supports exporting subscription updates as [OpenTelemetry](https://opentelemetry.io/) metrics using the [OTLP](https://opentelemetry.io/docs/specs/otlp/) protocol.
+`gnmic` can export subscription updates as [OpenTelemetry](https://opentelemetry.io/) metrics using the [OpenTelemetry Protocol (OTLP)](https://opentelemetry.io/docs/specs/otlp/).
 
-This output can be used to push metrics to any OTLP-compatible backend such as [Grafana Alloy](https://grafana.com/docs/alloy/latest/), [Grafana Mimir](https://grafana.com/docs/mimir/latest/), [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/), [Datadog](https://www.datadoghq.com/), [Dynatrace](https://www.dynatrace.com/), or any system that accepts OTLP metrics over gRPC or HTTP.
+The OTLP output supports both OTLP/gRPC and OTLP/HTTP. OTLP/gRPC commonly uses port `4317`; OTLP/HTTP commonly uses the HTTP/protobuf metrics endpoint on port `4318`.
 
 ## Configuration
 
-An OTLP output can be defined using the below format in `gnmic` config file under `outputs` section:
+An OTLP output can be defined under the `outputs` section of the `gnmic` configuration file:
 
 ```yaml
 outputs:
   output1:
     # required
     type: otlp
-    # required, address of the OTLP collector
+    # required, address of the OTLP endpoint
     endpoint: localhost:4317
     # string, transport protocol. One of "grpc" or "http".
-    # defaults to "grpc"
+    # defaults to "grpc".
     protocol: grpc
     # duration, defaults to 10s.
-    # RPC timeout for each export request.
+    # request timeout for each export attempt.
     timeout: 10s
-    # tls config
+    # tls config.
     tls:
-      # string, path to the CA certificate file,
-      # this will be used to verify the server certificate when `skip-verify` is false
+      # string, path to the CA certificate file.
+      # used to verify the server certificate when `skip-verify` is false.
       ca-file:
       # string, client certificate file.
       cert-file:
       # string, client key file.
       key-file:
-      # boolean, if true, the client will not verify the server
-      # certificate against the available certificate chain.
+      # boolean, if true, the client will not verify the server certificate.
       skip-verify: false
     # integer, defaults to 1000.
-    # number of events to buffer before sending a batch to the collector.
-    # events are sent every `interval` or when the batch is full, whichever comes first.
+    # number of events to buffer before sending a batch to the OTLP endpoint.
     batch-size: 1000
     # duration, defaults to 5s.
-    # time interval between export requests.
+    # events are sent every `interval` or when the batch is full, whichever comes first.
     interval: 5s
     # integer, defaults to 2x batch-size.
     # size of the internal event buffer.
-    buffer-size: 2000
+    # buffer-size:
     # integer, defaults to 3.
     # number of retries per export request on failure.
     max-retries: 3
-    # string, request body compression. Only honored when protocol is "http"
-    # (the gRPC path ignores this field).
+    # string, request body compression. Only honored when protocol is "http";
+    # the gRPC path ignores this field.
     # One of "none" or "gzip". Defaults to "gzip" when protocol is "http".
-    # Set to "none" to disable compression.
     compression: gzip
-    # string, to be used as the metric namespace
+    # string, metric namespace prefix.
     metric-prefix: ""
-    # boolean, if true the subscription name will be prepended to the metric name after the prefix.
+    # boolean, if true the subscription name is prepended to the metric name
+    # after the prefix.
     append-subscription-name: false
-    # boolean, if true, string type values are exported as gauge metrics with value=1
-    # and the string stored as an attribute named "value".
+    # boolean, if true, trims the leading "/" from gNMI paths before converting
+    # "/" to "_", avoiding a leading "_" in path-derived metric names.
+    # defaults to false.
+    strip-leading-underscore: false
+    # boolean, if true, string values are exported as gauge metrics with value=1
+    # and the string stored as a data point attribute named "value".
     # if false, string values are dropped.
     strings-as-attributes: false
     # list of tag keys to place as OTLP Resource attributes.
@@ -67,19 +69,16 @@ outputs:
       # - site
       # - source
     # list of regex patterns matched against the value key (metric path).
-    # if any pattern matches, the metric is exported as a monotonic cumulative Sum (counter).
+    # if any pattern matches, the metric is exported as a monotonic cumulative Sum.
     # unmatched metrics are exported as Gauges.
-    # defaults to empty (all metrics are Gauges).
     counter-patterns:
       # - "counter"
       # - "octets|packets|bytes"
       # - "errors|discards|drops"
     # map of string:string, additional static attributes to add to the OTLP Resource.
     resource-attributes:
-      # key: value
-    # map of string:string, HTTP headers (or gRPC metadata) to include with every export request.
-    # Use this to set tenant/org identifiers required by multi-tenant backends such as
-    # Grafana Mimir, Loki, or Tempo.
+      # service.name: gnmic
+    # map of string:string, HTTP headers or gRPC metadata to include with every export request.
     headers:
       # X-Scope-OrgID: my-tenant
     # integer, defaults to 1.
@@ -91,9 +90,93 @@ outputs:
     # boolean, defaults to false.
     # enables the collection and export (via prometheus) of output specific metrics.
     enable-metrics: false
-    # list of processors to apply on the message before writing
+    # list of processors to apply on the message before writing.
     event-processors:
 ```
+
+## Transport
+
+The `protocol` field selects the OTLP transport:
+
+| Protocol | Endpoint form | Notes |
+|---|---|---|
+| `grpc` | bare `host:port`, or a gRPC target URI such as `dns:///collector:4317` | default transport |
+| `http` | bare `host:port`, or a full `http://` or `https://` URL | sends protobuf-encoded OTLP metrics to `/v1/metrics` by default |
+
+Bare endpoints must include an explicit port. For example, use `collector:4317` for OTLP/gRPC or `collector:4318` for OTLP/HTTP.
+
+For OTLP/HTTP, a bare `host:port` endpoint is converted to a full metrics URL. If a `tls` block is configured the scheme is `https`; otherwise the scheme is `http`. The path defaults to `/v1/metrics`.
+
+```yaml
+outputs:
+  otlp-http:
+    type: otlp
+    protocol: http
+    endpoint: collector:4318
+```
+
+With the configuration above, `gnmic` posts OTLP metrics to:
+
+```text
+http://collector:4318/v1/metrics
+```
+
+When a full OTLP/HTTP URL is configured, `gnmic` preserves the scheme and path. If the path is empty or `/`, it defaults to `/v1/metrics`.
+
+```yaml
+outputs:
+  otlp-http:
+    type: otlp
+    protocol: http
+    endpoint: https://collector.example.com/otlp/v1/metrics
+```
+
+Only `http` and `https` URL schemes are accepted for OTLP/HTTP. URLs with user information, such as `https://user:pass@example.com`, are rejected; configure authentication data with `headers` instead.
+
+### TLS
+
+The `tls` block applies to both OTLP/gRPC and OTLP/HTTP.
+
+For OTLP/HTTP, `gnmic` rejects `http://` URLs when a `tls` block is configured. Use `https://` or a bare `host:port` endpoint when TLS is required.
+
+To use mutual TLS, configure `ca-file`, `cert-file`, and `key-file`:
+
+```yaml
+outputs:
+  otlp-http-mtls:
+    type: otlp
+    protocol: http
+    endpoint: collector.example.com:4318
+    tls:
+      ca-file: /etc/gnmic/certs/ca.crt
+      cert-file: /etc/gnmic/certs/client.crt
+      key-file: /etc/gnmic/certs/client.key
+```
+
+### Compression
+
+When `protocol: http` is used, request body compression defaults to `gzip`.
+
+Set `compression: none` to disable HTTP request compression:
+
+```yaml
+outputs:
+  otlp-http:
+    type: otlp
+    protocol: http
+    endpoint: collector:4318
+    compression: none
+```
+
+The `compression` field is ignored by the OTLP/gRPC transport.
+
+### Retries
+
+The `max-retries` field controls how many times a batch is retried after the initial export attempt.
+
+For OTLP/HTTP, `gnmic` follows the OTLP retryable HTTP status code list: `429`, `502`, `503`, and `504`. Other HTTP status codes are treated as permanent failures. When a retryable response includes a `Retry-After` header, `gnmic` honors it up to an internal cap of 30 seconds; otherwise it uses exponential backoff with jitter.
+
+OTLP `PartialSuccess` responses with rejected data points are not retried for either OTLP/gRPC or OTLP/HTTP. When output metrics are enabled, rejected data points are counted by `gnmic_otlp_output_rejected_data_points_total`.
 
 ## Metric Naming
 
@@ -105,15 +188,17 @@ The metric name is built from up to three parts joined by underscores:
 
 For example, a gNMI update from subscription `port-stats` with path:
 
-```
+```text
 /interfaces/interface[name=1/1/1]/state/counters/in-octets
 ```
 
 with `metric-prefix: gnmic` and `append-subscription-name: true`, produces a metric named:
 
-```
+```text
 gnmic_port_stats_interfaces_interface_state_counters_in_octets
 ```
+
+If `strip-leading-underscore` is `true`, a leading `/` is removed from the path before `/` is converted to `_`.
 
 ## Metric Type Detection
 
@@ -130,16 +215,16 @@ counter-patterns:
   - "errors|discards|drops"
 ```
 
-Each pattern is a Go [regexp](https://pkg.go.dev/regexp/syntax) matched against the value key (the gNMI path portion of the metric, **before name transformation**).
+Each pattern is a Go [regexp](https://pkg.go.dev/regexp/syntax) matched against the value key, before metric name transformation.
 
 ## Resource and Data Point Attributes
 
 Event tags are split between the OTLP Resource and data point attributes based on the `resource-tag-keys` configuration:
 
-- Tags whose keys appear in `resource-tag-keys` are placed as **Resource attributes** and excluded from data point attributes.
-- All remaining tags become **data point attributes** (equivalent to Prometheus labels).
+- Tags whose keys appear in `resource-tag-keys` are placed as Resource attributes and excluded from data point attributes.
+- All remaining tags become data point attributes.
 
-By default `resource-tag-keys` is empty, so all tags become data point attributes. To move device-level metadata to the OTLP Resource (keeping it out of Prometheus labels), configure it explicitly:
+By default `resource-tag-keys` is empty, so all tags become data point attributes. To move device-level metadata to the OTLP Resource, configure it explicitly:
 
 ```yaml
 resource-tag-keys:
@@ -154,35 +239,26 @@ Additional static attributes can be added to every Resource using `resource-attr
 
 ```yaml
 resource-attributes:
-  service.name: gnmic-collector
+  service.name: gnmic
   deployment.environment: production
 ```
 
-## OTLP Resource Grouping
+Events are grouped by their `source` tag. Each unique source becomes a separate OTLP `ResourceMetrics` entry with its own Resource attributes.
 
-Events are grouped by their `source` tag (the target device address). Each unique source becomes a separate OTLP `ResourceMetrics` entry with its own set of resource attributes.
+## Headers
 
-## Custom Headers
+The `headers` field attaches key/value pairs to every export request. They are sent as gRPC metadata when using `protocol: grpc`, and as HTTP headers when using `protocol: http`.
 
-The `headers` field attaches key/value pairs to every export request — as gRPC metadata when using the `grpc` protocol, or as HTTP headers when using `http`.
-
-This is required by multi-tenant Grafana backends (Mimir, Loki, Tempo) which use the `X-Scope-OrgID` header to route data to the correct tenant:
+This is commonly used by multi-tenant OTLP backends that require an organization or tenant identifier:
 
 ```yaml
 outputs:
-  mimir-output:
+  otlp-mimir:
     type: otlp
-    endpoint: mimir.example.com:4317
+    protocol: http
+    endpoint: mimir.example.com:4318
     headers:
       X-Scope-OrgID: my-tenant-id
-```
-
-Multiple headers can be set simultaneously:
-
-```yaml
-headers:
-  X-Scope-OrgID: my-tenant-id
-  X-Custom-Header: some-value
 ```
 
 ## OTLP Output Metrics
@@ -191,60 +267,56 @@ When `enable-metrics` is set to `true`, the OTLP output exposes the following Pr
 
 | Metric Name | Type | Description |
 |---|---|---|
-| `gnmic_otlp_output_number_of_sent_events_total` | Counter | Number of events successfully sent to the OTLP collector |
+| `gnmic_otlp_output_number_of_sent_events_total` | Counter | Number of events successfully sent to the OTLP endpoint |
 | `gnmic_otlp_output_number_of_failed_events_total` | Counter | Number of events that failed to send |
-| `gnmic_otlp_output_send_duration_seconds` | Histogram | Duration of sending batches to the OTLP collector |
-| `gnmic_otlp_output_rejected_data_points_total` | Counter | Number of data points rejected by the collector (PartialSuccess) |
+| `gnmic_otlp_output_send_duration_seconds` | Histogram | Duration of sending batches to the OTLP endpoint |
+| `gnmic_otlp_output_rejected_data_points_total` | Counter | Number of data points rejected by the OTLP endpoint in `PartialSuccess` responses |
 
-## Example: OTLP/HTTP with mTLS
+## Examples
 
-For backends that expose only OTLP/HTTP (such as NVIDIA Panoptes), set `protocol: http` and provide client certificates in the `tls` block.
-
-The `endpoint:` field accepts either a bare `host:port` or a full URL. With a bare value, the scheme is inferred from the presence of the `tls:` block (`https` if present, `http` otherwise) and the path defaults to `/v1/metrics`. With a full URL, the scheme is honored verbatim; the path is honored if specified, or defaults to `/v1/metrics` if absent or `/` (matching the `OTEL_EXPORTER_OTLP_ENDPOINT` convention used by upstream OpenTelemetry SDKs). Only `http` and `https` schemes are accepted; mixing `http://` with a populated `tls:` block is rejected at startup, since that combination silently disables mTLS.
-
-### External endpoint (public DNS)
+### OTLP/gRPC
 
 ```yaml
 outputs:
-  panoptes-external:
+  otlp-grpc:
     type: otlp
-    endpoint: panoptes.example.com:4318
+    protocol: grpc
+    endpoint: collector.example.com:4317
+    timeout: 10s
+    batch-size: 1000
+    interval: 5s
+```
+
+### OTLP/HTTP with mTLS
+
+```yaml
+outputs:
+  otlp-http:
+    type: otlp
     protocol: http
+    endpoint: collector.example.com:4318
     timeout: 10s
     tls:
-      ca-file:   /etc/pki/panoptes/ca.crt
-      cert-file: /etc/pki/gnmic/client.crt
-      key-file:  /etc/pki/gnmic/client.key
+      ca-file: /etc/gnmic/certs/ca.crt
+      cert-file: /etc/gnmic/certs/client.crt
+      key-file: /etc/gnmic/certs/client.key
     compression: gzip
     batch-size: 1000
     interval: 5s
     headers:
-      X-Scope-OrgID: your-tenant-id
+      X-Scope-OrgID: my-tenant-id
 ```
 
-### Intra-cluster endpoint (Kubernetes service)
-
-When gnmic runs as a pod in the same Kubernetes cluster as the OTLP backend, the K8s service DNS name is dialed directly — no ingress hop required. The `tls:` block is still used to validate the in-cluster server certificate (typically issued by cert-manager from the cluster CA).
+### OTLP/HTTP with a Kubernetes service
 
 ```yaml
 outputs:
-  panoptes-incluster:
+  otlp-http:
     type: otlp
-    # Resolves via CoreDNS to the panoptes Service ClusterIP.
-    # Short forms also work: `panoptes:4318` (same namespace) or
-    # `panoptes.observability:4318` (cross-namespace).
-    endpoint: panoptes.observability.svc.cluster.local:4318
     protocol: http
-    timeout: 10s
+    endpoint: collector.observability.svc.cluster.local:4318
     tls:
-      # CA bundle that signed the panoptes Service cert
-      # (often mounted from a cert-manager-managed Secret).
-      ca-file:   /var/run/secrets/panoptes/ca.crt
-      # Client cert+key for gnmic's identity (rotated by cert-manager
-      # via csi-driver-spiffe or a similar workload-identity flow).
+      ca-file: /var/run/secrets/otlp/ca.crt
       cert-file: /var/run/secrets/gnmic/tls.crt
-      key-file:  /var/run/secrets/gnmic/tls.key
-    compression: gzip
-    batch-size: 1000
-    interval: 5s
+      key-file: /var/run/secrets/gnmic/tls.key
 ```

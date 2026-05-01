@@ -8,6 +8,7 @@ In the context of gnmi subscriptions (on top of terminal output) `gnmic` support
 * [InfluxDB Time Series Database](influxdb_output.md)
 * [Prometheus Server](prometheus_output.md)
 * [Prometheus Remote Write](prometheus_write_output.md)
+* [OpenTelemetry](otlp_output.md)
 * [UDP Server](udp_output.md)
 * [TCP Server](tcp_output.md)
 
@@ -77,6 +78,7 @@ Different formats are supported for all outputs
 **UDP / TCP**     | <span>:heavy_check_mark:</span>    | <span>:heavy_check_mark:</span> | <span>:heavy_check_mark:</span>     |<span>:heavy_check_mark:</span> |<span>:heavy_check_mark:</span>
 **InfluxDB**      | <span>NA</span>                    | <span>NA</span>                 | <span>NA</span>                     |<span>NA</span>                 |<span>NA</span>                    
 **Prometheus**    | <span>NA</span>                    | <span>NA</span>                 | <span>NA</span>                     |<span>NA</span>                 |<span>NA</span>                    
+**OpenTelemetry** | <span>NA</span>                    | <span>NA</span>                 | <span>NA</span>                     |<span>NA</span>                 |<span>NA</span>
 
 #### Formats examples
 
