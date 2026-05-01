@@ -28,6 +28,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -895,6 +896,99 @@ func TestEffectiveRetrySleep_Table(t *testing.T) {
 			require.Equal(t, tc.want, got)
 		})
 	}
+}
+
+// TestUpdate_HTTPHeaderOnlyReload_NextBatchCarriesNewHeader drives the public
+// Update() API through the no-rebuild path (only cfg.Headers changed) and
+// verifies that the new header value reaches the server on the very next batch.
+//
+// Decision-path: needsTransportRebuild == false → cfg-only swap. Headers are
+// read per-request from state.cfg.Headers (Task 15c invariant), so a reload
+// that changes only the headers map takes effect without rebuilding the
+// HTTP transport.
+func TestUpdate_HTTPHeaderOnlyReload_NextBatchCarriesNewHeader(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		orgIDs []string
+	)
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		orgIDs = append(orgIDs, r.Header.Get("X-Scope-OrgID"))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	tlsCfgMap := map[string]interface{}{
+		"ca-file":   srv.CAPath(),
+		"cert-file": srv.ClientCertPath(),
+		"key-file":  srv.ClientKeyPath(),
+	}
+	baseCfgMap := map[string]interface{}{
+		"endpoint":   srv.URL,
+		"protocol":   "http",
+		"timeout":    "2s",
+		"batch-size": 1,
+		"interval":   "100ms",
+		"tls":        tlsCfgMap,
+		"headers":    map[string]interface{}{"X-Scope-OrgID": "tenant-A"},
+	}
+
+	o := &otlpOutput{}
+	require.NoError(t, o.Init(context.Background(), "test-header-reload", baseCfgMap,
+		outputs.WithLogger(log.New(io.Discard, "", 0)),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	))
+	defer o.Close()
+
+	// Send batch A — expect tenant-A.
+	o.WriteEvent(context.Background(), &formatters.EventMsg{
+		Name: "test", Timestamp: time.Now().UnixNano(),
+		Tags: map[string]string{"source": "x"}, Values: map[string]interface{}{"value": int64(1)},
+	})
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(orgIDs) >= 1
+	}, 2*time.Second, 20*time.Millisecond, "batch A must arrive at server")
+
+	mu.Lock()
+	firstID := orgIDs[len(orgIDs)-1]
+	mu.Unlock()
+	require.Equal(t, "tenant-A", firstID, "first batch must carry tenant-A header")
+
+	// Build a cfg map identical except for the header value (no transport rebuild).
+	updatedCfgMap := map[string]interface{}{
+		"endpoint":   srv.URL,
+		"protocol":   "http",
+		"timeout":    "2s",
+		"batch-size": 1,
+		"interval":   "100ms",
+		"tls":        tlsCfgMap,
+		"headers":    map[string]interface{}{"X-Scope-OrgID": "tenant-B"},
+	}
+	require.NoError(t, o.Update(context.Background(), updatedCfgMap))
+
+	// Send batch B — expect tenant-B.
+	countBefore := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(orgIDs)
+	}()
+	o.WriteEvent(context.Background(), &formatters.EventMsg{
+		Name: "test", Timestamp: time.Now().UnixNano(),
+		Tags: map[string]string{"source": "x"}, Values: map[string]interface{}{"value": int64(1)},
+	})
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(orgIDs) > countBefore
+	}, 2*time.Second, 20*time.Millisecond, "batch B must arrive after header-only reload")
+
+	mu.Lock()
+	lastID := orgIDs[len(orgIDs)-1]
+	mu.Unlock()
+	require.Equal(t, "tenant-B", lastID, "batch after header-only Update must carry tenant-B header")
 }
 
 // Statistical sanity for full-jitter distribution: many samples must span the

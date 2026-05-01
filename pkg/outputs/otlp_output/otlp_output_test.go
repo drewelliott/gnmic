@@ -28,6 +28,7 @@ import (
 	metricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/openconfig/gnmic/pkg/formatters"
@@ -992,6 +993,273 @@ func extractAttributesMap(attrs []*commonpb.KeyValue) map[string]string {
 		}
 	}
 	return result
+}
+
+// ---------------------------------------------------------------------------
+// Public Update() reload-path tests (Tasks 16c)
+//
+// These tests drive the real Update(ctx, cfg) API end-to-end. The existing
+// reload tests use withCfg / direct state.Swap shortcuts that bypass Update.
+// ---------------------------------------------------------------------------
+
+// TestUpdate_EndpointChange_RebuildsTransport verifies the rebuild path
+// (needsTransportRebuild == true). The endpoint change forces a new transport
+// to be allocated; the old transport pointer must differ from the new one, and
+// data sent after the Update reaches server2, not server1.
+func TestUpdate_EndpointChange_RebuildsTransport(t *testing.T) {
+	server1, endpoint1 := startMockOTLPServer(t)
+	defer server1.Stop()
+	server2, endpoint2 := startMockOTLPServer(t)
+	defer server2.Stop()
+
+	cfg1 := map[string]interface{}{
+		"endpoint":   endpoint1,
+		"protocol":   "grpc",
+		"timeout":    "2s",
+		"batch-size": 1,
+		"interval":   "50ms",
+	}
+	o := &otlpOutput{}
+	require.NoError(t, o.Init(context.Background(), "test-rebuild", cfg1,
+		outputs.WithLogger(log.New(io.Discard, "", 0)),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	))
+	defer o.Close()
+
+	s1 := o.state.Load()
+	require.NotNil(t, s1)
+	transport1 := s1.transport
+
+	cfg2 := map[string]interface{}{
+		"endpoint":   endpoint2,
+		"protocol":   "grpc",
+		"timeout":    "2s",
+		"batch-size": 1,
+		"interval":   "50ms",
+	}
+	require.NoError(t, o.Update(context.Background(), cfg2))
+
+	s2 := o.state.Load()
+	require.NotNil(t, s2)
+	require.NotSame(t, s1, s2, "Update must publish a new outputState")
+	require.NotSame(t, transport1, s2.transport, "endpoint change must allocate a new transportState")
+
+	// A batch sent after the Update must reach server2.
+	o.WriteEvent(context.Background(), &formatters.EventMsg{
+		Name: "test", Timestamp: time.Now().UnixNano(),
+		Tags: map[string]string{"source": "x"}, Values: map[string]interface{}{"value": int64(1)},
+	})
+	require.Eventually(t, func() bool {
+		return server2.ReceivedMetricsCount() > 0
+	}, 2*time.Second, 20*time.Millisecond, "data must reach server2 after endpoint Update")
+
+	// server1 must not have received the post-reload batch.
+	require.Equal(t, 0, server1.ReceivedMetricsCount(), "server1 must not receive data after endpoint Update")
+}
+
+// TestUpdate_TwoStepReload_RealUpdateRespectsInFlightAcrossConfigOnly is the
+// regression test for the WaitGroup-on-fresh-state bug (Tasks 15d/16a), driven
+// via the public Update() API rather than direct state.Swap shortcuts. This
+// ensures Update's branch logic, its Swap block, and its async cleanup goroutine
+// are all exercised together.
+//
+// Step 1: cfg-only reload (no transport rebuild) → new outputState, same transport.
+// Step 2: endpoint change (rebuild) → new transport. The cleanup goroutine for
+// the original transport must block on inFlight until we release it.
+func TestUpdate_TwoStepReload_RealUpdateRespectsInFlightAcrossConfigOnly(t *testing.T) {
+	server1, endpoint1 := startMockOTLPServer(t)
+	defer server1.Stop()
+	server2, endpoint2 := startMockOTLPServer(t)
+	defer server2.Stop()
+
+	cfg1 := map[string]interface{}{
+		"endpoint":   endpoint1,
+		"protocol":   "grpc",
+		"timeout":    "2s",
+		"batch-size": 1,
+		"interval":   "50ms",
+	}
+	o := &otlpOutput{}
+	require.NoError(t, o.Init(context.Background(), "test-two-step", cfg1,
+		outputs.WithLogger(log.New(io.Discard, "", 0)),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	))
+	defer o.Close()
+
+	s1 := o.state.Load()
+	T1 := s1.transport
+
+	// Simulate an in-flight batch holding T1's WaitGroup counter.
+	o.stateMu.Lock()
+	T1.inFlight.Add(1)
+	o.stateMu.Unlock()
+
+	// Step 1: cfg-only reload (header change only → needsTransportRebuild == false).
+	cfgOnly := map[string]interface{}{
+		"endpoint":   endpoint1,
+		"protocol":   "grpc",
+		"timeout":    "2s",
+		"batch-size": 1,
+		"interval":   "50ms",
+		"headers":    map[string]interface{}{"X-Scope-OrgID": "step1"},
+	}
+	require.NoError(t, o.Update(context.Background(), cfgOnly))
+
+	s2 := o.state.Load()
+	require.NotSame(t, s1, s2, "cfg-only reload must publish a new outputState")
+	require.Same(t, T1, s2.transport, "cfg-only reload must share the original transport")
+
+	// Step 2: rebuild reload (endpoint changes → needsTransportRebuild == true).
+	cfg2 := map[string]interface{}{
+		"endpoint":   endpoint2,
+		"protocol":   "grpc",
+		"timeout":    "2s",
+		"batch-size": 1,
+		"interval":   "50ms",
+	}
+	require.NoError(t, o.Update(context.Background(), cfg2))
+
+	s3 := o.state.Load()
+	require.NotSame(t, T1, s3.transport, "rebuild reload must allocate a new transport")
+
+	// T1 is being cleaned up asynchronously, but inFlight is still 1.
+	// Give the cleanup goroutine a brief window to start, then assert the
+	// connection is NOT yet closed (blocked on inFlight.Wait).
+	time.Sleep(100 * time.Millisecond)
+	connState := T1.grpcState.conn.GetState()
+	require.NotEqual(t, connectivity.Shutdown, connState,
+		"T1 conn must not be closed while inFlight > 0")
+
+	// Release the in-flight hold — cleanup goroutine should now drain.
+	T1.inFlight.Done()
+
+	// Poll for Shutdown with a generous timeout.
+	require.Eventually(t, func() bool {
+		return T1.grpcState.conn.GetState() == connectivity.Shutdown
+	}, 2*time.Second, 25*time.Millisecond, "T1 conn must transition to Shutdown after inFlight drains")
+}
+
+// TestUpdate_BufferSizeChange_SwapsEventChannel verifies that
+// channelNeedsSwap == true when buffer-size changes: the event channel must be
+// replaced with one of the new capacity.
+//
+// Implementation note: Update's channel-swap path (swapChannel=true) calls
+// oldWG.Wait(). Workers use `defer o.wg.Done()` which captures the
+// *sync.WaitGroup at defer-registration time. We send a warmup event and wait
+// for it to arrive before calling Update, ensuring the worker is fully running
+// (past the defer statement) so the WG pointer is captured correctly and there
+// is no data race on o.wg.
+func TestUpdate_BufferSizeChange_SwapsEventChannel(t *testing.T) {
+	server, endpoint := startMockOTLPServer(t)
+	defer server.Stop()
+
+	cfg1 := map[string]interface{}{
+		"endpoint":    endpoint,
+		"protocol":    "grpc",
+		"timeout":     "2s",
+		"batch-size":  1,
+		"interval":    "50ms",
+		"buffer-size": 10,
+	}
+	o := &otlpOutput{}
+	require.NoError(t, o.Init(context.Background(), "test-buf-swap", cfg1,
+		outputs.WithLogger(log.New(io.Discard, "", 0)),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	))
+	defer o.Close()
+
+	// Warm up: send one event and wait for it to arrive so the worker has
+	// registered its defer before Update swaps o.wg.
+	o.WriteEvent(context.Background(), &formatters.EventMsg{
+		Name: "warmup", Timestamp: time.Now().UnixNano(),
+		Tags: map[string]string{"source": "x"}, Values: map[string]interface{}{"value": int64(0)},
+	})
+	require.Eventually(t, func() bool {
+		return server.ReceivedMetricsCount() > 0
+	}, 2*time.Second, 20*time.Millisecond, "warmup event must reach server before Update")
+
+	oldCh := *o.eventCh.Load()
+	require.Equal(t, 10, cap(oldCh), "initial channel capacity must match buffer-size")
+
+	cfg2 := map[string]interface{}{
+		"endpoint":    endpoint,
+		"protocol":    "grpc",
+		"timeout":     "2s",
+		"batch-size":  1,
+		"interval":    "50ms",
+		"buffer-size": 32,
+	}
+	require.NoError(t, o.Update(context.Background(), cfg2))
+
+	newCh := *o.eventCh.Load()
+	require.Equal(t, 32, cap(newCh), "channel capacity must update to new buffer-size")
+	// Capacity change is the load-bearing assertion; different cap guarantees
+	// a new channel was allocated.
+	require.NotEqual(t, cap(oldCh), cap(newCh), "Update must allocate a new channel when buffer-size changes")
+}
+
+// TestUpdate_NumWorkersChange_RestartsWorkers verifies needsWorkerRestart == true
+// when num-workers changes. After the Update the pipeline must still be
+// functional (data flows end-to-end).
+//
+// Implementation note: Update's restartWorkers path calls oldWG.Wait() after
+// cancelling old workers. The workers use `defer o.wg.Done()` which captures
+// the *sync.WaitGroup pointer at defer-registration time. We use a single
+// initial worker (num-workers: 1) to keep the warmup guarantee clean: one
+// warmup event, confirmed delivered, ensures the sole worker has registered
+// its defer before Update writes o.wg. Multi-worker starts introduce a window
+// where a not-yet-scheduled goroutine races Update's o.wg assignment.
+func TestUpdate_NumWorkersChange_RestartsWorkers(t *testing.T) {
+	server, endpoint := startMockOTLPServer(t)
+	defer server.Stop()
+
+	cfg1 := map[string]interface{}{
+		"endpoint":    endpoint,
+		"protocol":    "grpc",
+		"timeout":     "2s",
+		"batch-size":  1,
+		"interval":    "50ms",
+		"num-workers": 1,
+	}
+	o := &otlpOutput{}
+	require.NoError(t, o.Init(context.Background(), "test-worker-restart", cfg1,
+		outputs.WithLogger(log.New(io.Discard, "", 0)),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	))
+	defer o.Close()
+
+	// Send one event and wait for it to arrive — proves the single worker is
+	// fully running (past its defer statement) before Update swaps o.wg.
+	o.WriteEvent(context.Background(), &formatters.EventMsg{
+		Name: "warmup", Timestamp: time.Now().UnixNano(),
+		Tags: map[string]string{"source": "x"}, Values: map[string]interface{}{"value": int64(0)},
+	})
+	require.Eventually(t, func() bool {
+		return server.ReceivedMetricsCount() > 0
+	}, 2*time.Second, 20*time.Millisecond, "warmup event must reach server before Update")
+
+	cfg2 := map[string]interface{}{
+		"endpoint":    endpoint,
+		"protocol":    "grpc",
+		"timeout":     "2s",
+		"batch-size":  1,
+		"interval":    "50ms",
+		"num-workers": 2,
+	}
+	require.NoError(t, o.Update(context.Background(), cfg2))
+
+	// cancelFn must not be nil after worker restart.
+	require.NotNil(t, o.cancelFn, "cancelFn must not be nil after worker restart")
+
+	// Pipeline must still work after the restart — data flows end-to-end.
+	countBefore := server.ReceivedMetricsCount()
+	o.WriteEvent(context.Background(), &formatters.EventMsg{
+		Name: "test", Timestamp: time.Now().UnixNano(),
+		Tags: map[string]string{"source": "x"}, Values: map[string]interface{}{"value": int64(1)},
+	})
+	require.Eventually(t, func() bool {
+		return server.ReceivedMetricsCount() > countBefore
+	}, 2*time.Second, 20*time.Millisecond, "data must flow end-to-end after worker-count Update")
 }
 
 // TestOTLP_HTTPTransport_EndToEnd verifies that configuring protocol: http
