@@ -1557,3 +1557,33 @@ func TestUpdate_TransportRebuildFailure_DoesNotApplyProcessors(t *testing.T) {
 	require.Same(t, s1, o.state.Load(),
 		"state must not be updated when transport rebuild fails")
 }
+
+// TestInit_GRPCBareEndpointWithoutPortRejected verifies that gRPC's bare-endpoint
+// form requires an explicit port, mirroring the HTTP path's resolveMetricsURL
+// discipline. A bare host like "panoptes" with no scheme and no port is rejected
+// at Init rather than passed through to grpc.NewClient where it would silently
+// resolve via the default resolver and dial the wrong port.
+func TestInit_GRPCBareEndpointWithoutPortRejected(t *testing.T) {
+	cases := []struct {
+		name     string
+		endpoint string
+	}{
+		{"no_port", "panoptes"},
+		{"trailing_colon", "panoptes:"},
+		{"port_only", ":4317"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o := &otlpOutput{}
+			err := o.Init(context.Background(), "test-grpc-bare", map[string]any{
+				"endpoint": tc.endpoint,
+				"protocol": "grpc",
+			},
+				outputs.WithLogger(log.New(io.Discard, "", 0)),
+				outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+			)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "must be host:port")
+		})
+	}
+}

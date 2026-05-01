@@ -15,9 +15,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -872,6 +874,23 @@ func (o *otlpOutput) buildEventProcessors(cfg *config) ([]formatters.EventProces
 }
 
 func (o *otlpOutput) initGRPCFor(cfg *config) (*grpcClientState, error) {
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+
+	// Reject bare host-only endpoints with no port. Forms with an explicit
+	// scheme like "dns:///host:port" or "unix:///path" pass through to
+	// grpc.NewClient, which has its own resolver semantics. The bare form is
+	// strictly host:port — silent fall-through to grpc's default resolver
+	// behavior on a missing port surprises operators who omitted it.
+	if !strings.Contains(endpoint, "://") {
+		host, port, err := net.SplitHostPort(endpoint)
+		if err != nil {
+			return nil, fmt.Errorf("bare gRPC endpoint %q must be host:port: %w", endpoint, err)
+		}
+		if host == "" || port == "" {
+			return nil, fmt.Errorf("bare gRPC endpoint %q must be host:port (e.g. host:4317)", endpoint)
+		}
+	}
+
 	var opts []grpc.DialOption
 
 	if cfg.TLS != nil {
@@ -884,12 +903,12 @@ func (o *otlpOutput) initGRPCFor(cfg *config) (*grpcClientState, error) {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	}
 
-	conn, err := grpc.NewClient(cfg.Endpoint, opts...)
+	conn, err := grpc.NewClient(endpoint, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create OTLP client: %w", err)
 	}
 
-	o.logger.Printf("initialized OTLP gRPC client for endpoint: %s", cfg.Endpoint)
+	o.logger.Printf("initialized OTLP gRPC client for endpoint: %s", endpoint)
 	return &grpcClientState{
 		conn:   conn,
 		client: metricsv1.NewMetricsServiceClient(conn),
