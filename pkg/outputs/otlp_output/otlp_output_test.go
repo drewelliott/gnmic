@@ -1142,13 +1142,6 @@ func TestUpdate_TwoStepReload_RealUpdateRespectsInFlightAcrossConfigOnly(t *test
 // TestUpdate_BufferSizeChange_SwapsEventChannel verifies that
 // channelNeedsSwap == true when buffer-size changes: the event channel must be
 // replaced with one of the new capacity.
-//
-// Implementation note: Update's channel-swap path (swapChannel=true) calls
-// oldWG.Wait(). Workers use `defer o.wg.Done()` which captures the
-// *sync.WaitGroup at defer-registration time. We send a warmup event and wait
-// for it to arrive before calling Update, ensuring the worker is fully running
-// (past the defer statement) so the WG pointer is captured correctly and there
-// is no data race on o.wg.
 func TestUpdate_BufferSizeChange_SwapsEventChannel(t *testing.T) {
 	server, endpoint := startMockOTLPServer(t)
 	defer server.Stop()
@@ -1167,16 +1160,6 @@ func TestUpdate_BufferSizeChange_SwapsEventChannel(t *testing.T) {
 		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
 	))
 	defer o.Close()
-
-	// Warm up: send one event and wait for it to arrive so the worker has
-	// registered its defer before Update swaps o.wg.
-	o.WriteEvent(context.Background(), &formatters.EventMsg{
-		Name: "warmup", Timestamp: time.Now().UnixNano(),
-		Tags: map[string]string{"source": "x"}, Values: map[string]interface{}{"value": int64(0)},
-	})
-	require.Eventually(t, func() bool {
-		return server.ReceivedMetricsCount() > 0
-	}, 2*time.Second, 20*time.Millisecond, "warmup event must reach server before Update")
 
 	oldCh := *o.eventCh.Load()
 	require.Equal(t, 10, cap(oldCh), "initial channel capacity must match buffer-size")
@@ -1201,14 +1184,6 @@ func TestUpdate_BufferSizeChange_SwapsEventChannel(t *testing.T) {
 // TestUpdate_NumWorkersChange_RestartsWorkers verifies needsWorkerRestart == true
 // when num-workers changes. After the Update the pipeline must still be
 // functional (data flows end-to-end).
-//
-// Implementation note: Update's restartWorkers path calls oldWG.Wait() after
-// cancelling old workers. The workers use `defer o.wg.Done()` which captures
-// the *sync.WaitGroup pointer at defer-registration time. We use a single
-// initial worker (num-workers: 1) to keep the warmup guarantee clean: one
-// warmup event, confirmed delivered, ensures the sole worker has registered
-// its defer before Update writes o.wg. Multi-worker starts introduce a window
-// where a not-yet-scheduled goroutine races Update's o.wg assignment.
 func TestUpdate_NumWorkersChange_RestartsWorkers(t *testing.T) {
 	server, endpoint := startMockOTLPServer(t)
 	defer server.Stop()
@@ -1219,7 +1194,7 @@ func TestUpdate_NumWorkersChange_RestartsWorkers(t *testing.T) {
 		"timeout":     "2s",
 		"batch-size":  1,
 		"interval":    "50ms",
-		"num-workers": 1,
+		"num-workers": 2,
 	}
 	o := &otlpOutput{}
 	require.NoError(t, o.Init(context.Background(), "test-worker-restart", cfg1,
@@ -1228,23 +1203,13 @@ func TestUpdate_NumWorkersChange_RestartsWorkers(t *testing.T) {
 	))
 	defer o.Close()
 
-	// Send one event and wait for it to arrive — proves the single worker is
-	// fully running (past its defer statement) before Update swaps o.wg.
-	o.WriteEvent(context.Background(), &formatters.EventMsg{
-		Name: "warmup", Timestamp: time.Now().UnixNano(),
-		Tags: map[string]string{"source": "x"}, Values: map[string]interface{}{"value": int64(0)},
-	})
-	require.Eventually(t, func() bool {
-		return server.ReceivedMetricsCount() > 0
-	}, 2*time.Second, 20*time.Millisecond, "warmup event must reach server before Update")
-
 	cfg2 := map[string]interface{}{
 		"endpoint":    endpoint,
 		"protocol":    "grpc",
 		"timeout":     "2s",
 		"batch-size":  1,
 		"interval":    "50ms",
-		"num-workers": 2,
+		"num-workers": 4,
 	}
 	require.NoError(t, o.Update(context.Background(), cfg2))
 

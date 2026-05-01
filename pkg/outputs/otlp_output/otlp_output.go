@@ -359,7 +359,7 @@ func (o *otlpOutput) Init(ctx context.Context, name string, cfg map[string]inter
 	wctx, o.cancelFn = context.WithCancel(o.rootCtx)
 	o.wg.Add(ncfg.NumWorkers)
 	for i := 0; i < ncfg.NumWorkers; i++ {
-		go o.worker(wctx, i)
+		go o.worker(wctx, i, o.wg)
 	}
 
 	o.logger.Printf("initialized OTLP output: endpoint=%s, protocol=%s, batch-size=%d, workers=%d",
@@ -469,9 +469,9 @@ func (o *otlpOutput) Update(ctx context.Context, cfg map[string]any) error {
 		o.wg = newWG
 		o.eventCh.Store(&newChan)
 
-		o.wg.Add(newCfg.NumWorkers)
+		newWG.Add(newCfg.NumWorkers)
 		for i := 0; i < newCfg.NumWorkers; i++ {
-			go o.worker(runCtx, i)
+			go o.worker(runCtx, i, newWG)
 		}
 
 		if oldCancel != nil {
@@ -648,9 +648,13 @@ func (o *otlpOutput) Close() error {
 	return nil
 }
 
-// worker processes events in batches
-func (o *otlpOutput) worker(ctx context.Context, id int) {
-	defer o.wg.Done()
+// worker processes events in batches.
+// wg is passed explicitly (rather than read from o.wg) so each goroutine
+// captures its own WaitGroup pointer at spawn time. Update swaps o.wg when
+// num-workers/batch-size/interval change; reading o.wg from the worker
+// would race that swap and could land Done() on the wrong WaitGroup.
+func (o *otlpOutput) worker(ctx context.Context, id int, wg *sync.WaitGroup) {
+	defer wg.Done()
 
 	cfg := o.loadCfg()
 	if cfg.Debug {
