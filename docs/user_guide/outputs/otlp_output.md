@@ -135,7 +135,17 @@ Metric names are built from:
 2. The subscription name, if `append-subscription-name` is `true`.
 3. The gNMI value path, with `/` and `-` replaced by `_`.
 
-For example, a gNMI update from subscription `port-stats` with path:
+For example, given a subscription named `port-stats` defined under the `subscriptions:` section of the `gnmic` configuration:
+
+```yaml
+subscriptions:
+  port-stats:
+    paths:
+      - /interfaces/interface/state/counters/in-octets
+    mode: stream
+```
+
+a gNMI update from this subscription with path:
 
 ```text
 /interfaces/interface[name=1/1/1]/state/counters/in-octets
@@ -146,6 +156,8 @@ with `metric-prefix: gnmic` and `append-subscription-name: true`, produces:
 ```text
 gnmic_port_stats__interfaces_interface_state_counters_in_octets
 ```
+
+The `port_stats` segment is the subscription name `port-stats` after `-` is converted to `_` (Prometheus does not allow hyphens in metric names).
 
 The leading `/` of the gNMI path becomes a leading `_` in the path-derived segment, which combines with the trailing `_` of the prefix or subscription name to form a `__` separator. Set `strip-leading-underscore: true` to elide the leading `/` and produce a single-`_` separator:
 
