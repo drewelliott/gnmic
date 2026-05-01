@@ -144,10 +144,14 @@ For example, a gNMI update from subscription `port-stats` with path:
 with `metric-prefix: gnmic` and `append-subscription-name: true`, produces:
 
 ```text
-gnmic_port_stats_interfaces_interface_state_counters_in_octets
+gnmic_port_stats__interfaces_interface_state_counters_in_octets
 ```
 
-If `strip-leading-underscore` is `true`, a leading `/` is removed from the path before `/` is converted to `_`.
+The leading `/` of the gNMI path becomes a leading `_` in the path-derived segment, which combines with the trailing `_` of the prefix or subscription name to form a `__` separator. Set `strip-leading-underscore: true` to elide the leading `/` and produce a single-`_` separator:
+
+```text
+gnmic_port_stats_interfaces_interface_state_counters_in_octets
+```
 
 ## Metric Types
 
