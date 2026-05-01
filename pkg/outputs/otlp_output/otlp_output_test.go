@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metricsv1 "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
@@ -1076,4 +1077,134 @@ func TestOTLP_HTTPTransport_EndToEnd(t *testing.T) {
 	var req metricsv1.ExportMetricsServiceRequest
 	require.NoError(t, proto.Unmarshal(body, &req))
 	require.NotEmpty(t, req.ResourceMetrics, "ResourceMetrics must be populated")
+}
+
+// TestInit_FailureAfterRegisterMetrics_UnregistersCleanly verifies that when
+// Init fails after registerMetrics succeeds, the collectors are unregistered so
+// that a subsequent Init retry on the same *otlpOutput and same registry does
+// not collide.
+func TestInit_FailureAfterRegisterMetrics_UnregistersCleanly(t *testing.T) {
+	reg := prometheus.NewRegistry()
+
+	// A bad TLS path causes buildOutputState→initHTTPFor to fail after
+	// registerMetrics has already registered the four collectors.
+	badCfg := map[string]interface{}{
+		"endpoint": "http://127.0.0.1:9999",
+		"protocol": "http",
+		"tls": map[string]interface{}{
+			"ca-file": "/nonexistent/ca.pem", // guaranteed to fail
+		},
+		"enable-metrics": true,
+	}
+
+	o := &otlpOutput{}
+
+	// First Init: must fail (bad TLS).
+	err := o.Init(context.Background(), "test-cleanup", badCfg,
+		outputs.WithRegistry(reg),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	)
+	require.Error(t, err, "first Init must fail (bad TLS path)")
+
+	// After failure the collectors must NOT still be registered.
+	// If they are, reg.Register would return an AlreadyRegisteredError.
+	require.NoError(t, reg.Register(otlpNumberOfSentEvents),
+		"otlpNumberOfSentEvents must be unregistered after Init failure")
+	// Clean up so the package-level variable is not left registered in this registry.
+	reg.Unregister(otlpNumberOfSentEvents)
+
+	// Second Init with a valid config on the same *otlpOutput must succeed.
+	server, endpoint := startMockOTLPServer(t)
+	defer server.Stop()
+
+	goodCfg := map[string]interface{}{
+		"endpoint":       endpoint,
+		"protocol":       "grpc",
+		"enable-metrics": true,
+	}
+	reg2 := prometheus.NewRegistry()
+	err = o.Init(context.Background(), "test-cleanup", goodCfg,
+		outputs.WithRegistry(reg2),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	)
+	require.NoError(t, err, "second Init retry must succeed without duplicate-registration error")
+	defer o.Close()
+}
+
+// TestRegisterMetrics_PartialFailure_UnregistersWhatItRegistered verifies that
+// when registerMetrics fails mid-way (because one collector is already registered
+// externally), it rolls back the collectors it successfully registered so that
+// no partial-registration state leaks.
+func TestRegisterMetrics_PartialFailure_UnregistersWhatItRegistered(t *testing.T) {
+	reg := prometheus.NewRegistry()
+
+	// Pre-register otlpSendDuration (the third collector in registerMetrics order)
+	// to force a failure after the first two have been registered.
+	require.NoError(t, reg.Register(otlpSendDuration))
+
+	o := &otlpOutput{}
+	o.reg = reg
+
+	err := o.registerMetrics(&config{EnableMetrics: true, Name: "x"})
+	require.Error(t, err, "registerMetrics must fail because otlpSendDuration is pre-registered")
+
+	// The two collectors that got registered before the failure must have been
+	// rolled back. Verify by registering them again — should succeed.
+	require.NoError(t, reg.Register(otlpNumberOfSentEvents),
+		"otlpNumberOfSentEvents must be unregistered after partial failure")
+	require.NoError(t, reg.Register(otlpNumberOfFailedEvents),
+		"otlpNumberOfFailedEvents must be unregistered after partial failure")
+
+	// Note: Prometheus Unregister does not distinguish between "registered by us"
+	// and "registered externally" — it matches by collector identity (Describe).
+	// Because otlpSendDuration is a package-level var, unregisterMetrics will
+	// remove it even though we didn't register it in this call. That is
+	// acceptable: the important property is that we never leave partially-owned
+	// collectors behind; ownership of a shared package-level collector via a
+	// fresh registry is always ephemeral in test scenarios.
+	// (No assertion here — behavior is documented above for clarity.)
+
+	// Cleanup.
+	reg.Unregister(otlpNumberOfSentEvents)
+	reg.Unregister(otlpNumberOfFailedEvents)
+	reg.Unregister(otlpSendDuration)
+}
+
+// TestClose_UnregistersMetrics verifies that after a successful Init+Close cycle
+// the collectors are unregistered, so a subsequent Init does not hit a
+// duplicate-registration error.
+func TestClose_UnregistersMetrics(t *testing.T) {
+	server, endpoint := startMockOTLPServer(t)
+	defer server.Stop()
+
+	reg := prometheus.NewRegistry()
+
+	cfg := map[string]interface{}{
+		"endpoint":       endpoint,
+		"protocol":       "grpc",
+		"enable-metrics": true,
+	}
+
+	o := &otlpOutput{}
+	require.NoError(t, o.Init(context.Background(), "test-close-metrics", cfg,
+		outputs.WithRegistry(reg),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	))
+
+	require.NoError(t, o.Close())
+
+	// After Close, all four collectors must be unregistered.
+	require.NoError(t, reg.Register(otlpNumberOfSentEvents),
+		"otlpNumberOfSentEvents must be unregistered after Close")
+	require.NoError(t, reg.Register(otlpNumberOfFailedEvents),
+		"otlpNumberOfFailedEvents must be unregistered after Close")
+	require.NoError(t, reg.Register(otlpSendDuration),
+		"otlpSendDuration must be unregistered after Close")
+	require.NoError(t, reg.Register(otlpRejectedDataPoints),
+		"otlpRejectedDataPoints must be unregistered after Close")
+	// Cleanup.
+	reg.Unregister(otlpNumberOfSentEvents)
+	reg.Unregister(otlpNumberOfFailedEvents)
+	reg.Unregister(otlpSendDuration)
+	reg.Unregister(otlpRejectedDataPoints)
 }

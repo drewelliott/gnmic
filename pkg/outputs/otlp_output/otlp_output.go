@@ -323,6 +323,15 @@ func (o *otlpOutput) Init(ctx context.Context, name string, cfg map[string]inter
 		return err
 	}
 
+	// From this point on, any error must unregister the collectors we just
+	// registered; otherwise a retry of Init will hit "duplicate registration".
+	initSucceeded := false
+	defer func() {
+		if !initSucceeded {
+			o.unregisterMetrics()
+		}
+	}()
+
 	// Build event processors (no transport open yet).
 	dc := new(dynConfig)
 	dc.evps, err = o.buildEventProcessors(ncfg)
@@ -356,6 +365,7 @@ func (o *otlpOutput) Init(ctx context.Context, name string, cfg map[string]inter
 	o.logger.Printf("initialized OTLP output: endpoint=%s, protocol=%s, batch-size=%d, workers=%d",
 		ncfg.Endpoint, ncfg.Protocol, ncfg.BatchSize, ncfg.NumWorkers)
 
+	initSucceeded = true
 	return nil
 }
 
@@ -633,6 +643,8 @@ func (o *otlpOutput) Close() error {
 	if oldState != nil {
 		oldState.transport.cleanup()
 	}
+
+	o.unregisterMetrics()
 	return nil
 }
 
@@ -886,6 +898,22 @@ func (o *otlpOutput) createTLSConfigFor(cfg *config) (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
+// unregisterMetrics removes any of this output's collectors that are registered
+// with o.reg. Safe on partial registration and safe to call when EnableMetrics
+// is false or o.reg is nil. Used both:
+//   - inside registerMetrics to roll back a partial registration on failure
+//   - in Init's deferred cleanup path when a later step fails after registerMetrics succeeded
+//   - in Close to free the collectors so a future Init on the same registry works
+func (o *otlpOutput) unregisterMetrics() {
+	if o.reg == nil {
+		return
+	}
+	o.reg.Unregister(otlpNumberOfSentEvents)
+	o.reg.Unregister(otlpNumberOfFailedEvents)
+	o.reg.Unregister(otlpSendDuration)
+	o.reg.Unregister(otlpRejectedDataPoints)
+}
+
 func (o *otlpOutput) registerMetrics(cfg *config) error {
 	if !cfg.EnableMetrics {
 		return nil
@@ -894,6 +922,13 @@ func (o *otlpOutput) registerMetrics(cfg *config) error {
 	if o.reg == nil {
 		return nil
 	}
+
+	success := false
+	defer func() {
+		if !success {
+			o.unregisterMetrics()
+		}
+	}()
 
 	if err := o.reg.Register(otlpNumberOfSentEvents); err != nil {
 		return err
@@ -908,6 +943,7 @@ func (o *otlpOutput) registerMetrics(cfg *config) error {
 		return err
 	}
 
+	success = true
 	return nil
 }
 
