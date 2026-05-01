@@ -17,8 +17,21 @@ RUN go mod download
 
 ADD . /build
 
-#RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o gnmic .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o gnmic .
+# Build-time metadata baked into the binary so `gnmic --version` identifies
+# the exact build. Defaults reflect a from-source build with no metadata
+# provided; CI/Docker invocations should pass --build-arg for each.
+ARG VERSION=dev
+ARG COMMIT=none
+ARG BUILD_DATE=unknown
+ARG GIT_URL=https://github.com/openconfig/gnmic
+
+RUN CGO_ENABLED=0 go build \
+    -ldflags="-s -w \
+        -X github.com/openconfig/gnmic/pkg/version.Version=${VERSION} \
+        -X github.com/openconfig/gnmic/pkg/version.Commit=${COMMIT} \
+        -X github.com/openconfig/gnmic/pkg/version.Date=${BUILD_DATE} \
+        -X github.com/openconfig/gnmic/pkg/version.GitURL=${GIT_URL}" \
+    -o gnmic .
 
 FROM alpine
 LABEL org.opencontainers.image.source=https://github.com/openconfig/gnmic
