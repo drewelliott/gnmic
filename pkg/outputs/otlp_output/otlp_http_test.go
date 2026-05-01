@@ -232,8 +232,13 @@ func TestResolveMetricsURL(t *testing.T) {
 		// Decision-path: per the OTLP exporter spec, only http and https schemes are valid.
 		{"unsupported_scheme_ftp", "ftp://example.com:4318", false, "", true},
 		{"unsupported_scheme_grpc", "grpc://example.com:4317", false, "", true},
-		// Decision-path: port-only ":4318" must NOT pass — Hostname() check catches it.
+		// Decision-path: port-only ":4318" must NOT pass — SplitHostPort gives host=="".
 		{"port_only_bare_rejected", ":4318", false, "", true},
+		// Decision-path: bare endpoint must include a port; OTLP has no convention
+		// for defaulting bare HTTP endpoints to 80/443, so silently doing so would
+		// surprise operators who omitted the port by mistake.
+		{"bare_no_port_rejected", "panoptes", false, "", true},
+		{"bare_trailing_colon_rejected", "panoptes:", false, "", true},
 		// Decision-path: bare endpoint must be host:port only; paths require a full URL.
 		{"bare_endpoint_with_path_rejected", "localhost:4318/custom", false, "", true},
 		// Decision-path: userinfo in URL must be rejected — auth goes through Headers config.
