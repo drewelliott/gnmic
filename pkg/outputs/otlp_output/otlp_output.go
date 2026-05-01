@@ -80,7 +80,8 @@ type otlpOutput struct {
 	wg       *sync.WaitGroup
 
 	// Metrics
-	reg *prometheus.Registry
+	reg               *prometheus.Registry
+	registeredMetrics []prometheus.Collector // collectors this instance successfully registered
 	// store
 	store store.Store[any]
 }
@@ -902,8 +903,8 @@ func (o *otlpOutput) createTLSConfigFor(cfg *config) (*tls.Config, error) {
 	return tlsConfig, nil
 }
 
-// unregisterMetrics removes any of this output's collectors that are registered
-// with o.reg. Safe on partial registration and safe to call when EnableMetrics
+// unregisterMetrics removes only the collectors this instance successfully
+// registered. Safe on partial registration and safe to call when EnableMetrics
 // is false or o.reg is nil. Used both:
 //   - inside registerMetrics to roll back a partial registration on failure
 //   - in Init's deferred cleanup path when a later step fails after registerMetrics succeeded
@@ -912,10 +913,10 @@ func (o *otlpOutput) unregisterMetrics() {
 	if o.reg == nil {
 		return
 	}
-	o.reg.Unregister(otlpNumberOfSentEvents)
-	o.reg.Unregister(otlpNumberOfFailedEvents)
-	o.reg.Unregister(otlpSendDuration)
-	o.reg.Unregister(otlpRejectedDataPoints)
+	for _, c := range o.registeredMetrics {
+		o.reg.Unregister(c)
+	}
+	o.registeredMetrics = nil
 }
 
 func (o *otlpOutput) registerMetrics(cfg *config) error {
@@ -934,17 +935,17 @@ func (o *otlpOutput) registerMetrics(cfg *config) error {
 		}
 	}()
 
-	if err := o.reg.Register(otlpNumberOfSentEvents); err != nil {
-		return err
+	collectors := []prometheus.Collector{
+		otlpNumberOfSentEvents,
+		otlpNumberOfFailedEvents,
+		otlpSendDuration,
+		otlpRejectedDataPoints,
 	}
-	if err := o.reg.Register(otlpNumberOfFailedEvents); err != nil {
-		return err
-	}
-	if err := o.reg.Register(otlpSendDuration); err != nil {
-		return err
-	}
-	if err := o.reg.Register(otlpRejectedDataPoints); err != nil {
-		return err
+	for _, c := range collectors {
+		if err := o.reg.Register(c); err != nil {
+			return err
+		}
+		o.registeredMetrics = append(o.registeredMetrics, c)
 	}
 
 	success = true

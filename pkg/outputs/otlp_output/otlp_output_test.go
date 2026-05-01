@@ -1364,15 +1364,15 @@ func TestInit_FailureAfterRegisterMetrics_UnregistersCleanly(t *testing.T) {
 	defer o.Close()
 }
 
-// TestRegisterMetrics_PartialFailure_UnregistersWhatItRegistered verifies that
-// when registerMetrics fails mid-way (because one collector is already registered
-// externally), it rolls back the collectors it successfully registered so that
-// no partial-registration state leaks.
-func TestRegisterMetrics_PartialFailure_UnregistersWhatItRegistered(t *testing.T) {
+// TestRegisterMetrics_PartialFailure_DoesNotRemoveExternallyOwnedCollectors
+// verifies that the per-instance ownership tracking means rollback only removes
+// collectors this instance registered — not the externally pre-registered one
+// that caused the failure.
+func TestRegisterMetrics_PartialFailure_DoesNotRemoveExternallyOwnedCollectors(t *testing.T) {
 	reg := prometheus.NewRegistry()
 
 	// Pre-register otlpSendDuration (the third collector in registerMetrics order)
-	// to force a failure after the first two have been registered.
+	// to simulate another owner having registered it before us.
 	require.NoError(t, reg.Register(otlpSendDuration))
 
 	o := &otlpOutput{}
@@ -1381,21 +1381,23 @@ func TestRegisterMetrics_PartialFailure_UnregistersWhatItRegistered(t *testing.T
 	err := o.registerMetrics(&config{EnableMetrics: true, Name: "x"})
 	require.Error(t, err, "registerMetrics must fail because otlpSendDuration is pre-registered")
 
-	// The two collectors that got registered before the failure must have been
-	// rolled back. Verify by registering them again — should succeed.
+	// 1. The first two collectors (which this instance registered) must have been
+	//    rolled back — re-registering them must succeed.
 	require.NoError(t, reg.Register(otlpNumberOfSentEvents),
-		"otlpNumberOfSentEvents must be unregistered after partial failure")
+		"otlpNumberOfSentEvents must be unregistered after partial failure (owned by this instance)")
 	require.NoError(t, reg.Register(otlpNumberOfFailedEvents),
-		"otlpNumberOfFailedEvents must be unregistered after partial failure")
+		"otlpNumberOfFailedEvents must be unregistered after partial failure (owned by this instance)")
 
-	// Note: Prometheus Unregister does not distinguish between "registered by us"
-	// and "registered externally" — it matches by collector identity (Describe).
-	// Because otlpSendDuration is a package-level var, unregisterMetrics will
-	// remove it even though we didn't register it in this call. That is
-	// acceptable: the important property is that we never leave partially-owned
-	// collectors behind; ownership of a shared package-level collector via a
-	// fresh registry is always ephemeral in test scenarios.
-	// (No assertion here — behavior is documented above for clarity.)
+	// 2. otlpSendDuration was NOT registered by this instance, so the rollback
+	//    must NOT have removed it — re-registering it must return AlreadyRegisteredError.
+	err = reg.Register(otlpSendDuration)
+	require.Error(t, err, "otlpSendDuration must still be registered (externally owned, rollback must not touch it)")
+	var alreadyErr prometheus.AlreadyRegisteredError
+	require.ErrorAs(t, err, &alreadyErr,
+		"error must be AlreadyRegisteredError — otlpSendDuration survived the rollback")
+
+	// 3. registeredMetrics must be nil after rollback (drained).
+	require.Nil(t, o.registeredMetrics, "registeredMetrics must be nil after rollback")
 
 	// Cleanup.
 	reg.Unregister(otlpNumberOfSentEvents)
