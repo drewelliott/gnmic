@@ -1,6 +1,6 @@
 `gnmic` supports exporting subscription updates as [OpenTelemetry](https://opentelemetry.io/) metrics using the [OTLP](https://opentelemetry.io/docs/specs/otlp/) protocol.
 
-This output can be used to push metrics to any OTLP-compatible backend such as [Grafana Alloy](https://grafana.com/docs/alloy/latest/), [Grafana Mimir](https://grafana.com/docs/mimir/latest/), [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/), [Datadog](https://www.datadoghq.com/), [Dynatrace](https://www.dynatrace.com/), or any system that accepts OTLP metrics over gRPC.
+This output can be used to push metrics to any OTLP-compatible backend such as [Grafana Alloy](https://grafana.com/docs/alloy/latest/), [Grafana Mimir](https://grafana.com/docs/mimir/latest/), [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/), [Datadog](https://www.datadoghq.com/), [Dynatrace](https://www.dynatrace.com/), or any system that accepts OTLP metrics over gRPC or HTTP.
 
 ## Configuration
 
