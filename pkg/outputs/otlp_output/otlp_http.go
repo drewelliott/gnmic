@@ -127,9 +127,10 @@ func resolveMetricsURL(endpoint string, tlsEnabled bool) (string, error) {
 	// If no scheme, synthesize one. The bare form is strictly host:port — a
 	// path component here is a configuration mistake (e.g. "localhost:4318/foo")
 	// that we reject rather than silently mangle into "/foo/v1/metrics".
-	// A missing port is also rejected: OTLP/HTTP has no convention to default
-	// to 80/443 (the OTLP spec assigns no fixed default for HTTP), so silently
-	// dialing those would surprise operators who omitted the port by mistake.
+	// A missing port is also rejected: gnmic requires the port to be explicit
+	// for bare endpoints rather than guessing 4318 (the OTLP/HTTP convention)
+	// or falling through to URL scheme defaults (80/443). Operators who omit
+	// the port by mistake would otherwise dial the wrong service silently.
 	if !strings.Contains(endpoint, "://") {
 		if strings.ContainsRune(endpoint, '/') {
 			return "", fmt.Errorf("bare endpoint %q must be host:port only; use a full URL if a path is needed", endpoint)
