@@ -1498,3 +1498,62 @@ func TestClose_UnregistersMetrics(t *testing.T) {
 	reg.Unregister(otlpSendDuration)
 	reg.Unregister(otlpRejectedDataPoints)
 }
+
+// TestUpdate_TransportRebuildFailure_DoesNotApplyProcessors verifies that when
+// Update's buildOutputState fails, o.dynCfg is NOT updated. In the buggy code,
+// o.dynCfg.Store(dc) ran before buildOutputState, so a new dc pointer was always
+// published regardless of whether the transport build succeeded.
+//
+// We test with a protocol change (grpc → http) and an ftp:// endpoint that passes
+// validateConfig but is rejected by initHTTPFor's resolveMetricsURL (unsupported
+// scheme). Event-processors remain unchanged so rebuildProcessors is false — the
+// test focuses on the transport-failure branch.
+func TestUpdate_TransportRebuildFailure_DoesNotApplyProcessors(t *testing.T) {
+	server, endpoint := startMockOTLPServer(t)
+	defer server.Stop()
+
+	cfg1 := map[string]interface{}{
+		"endpoint":   endpoint,
+		"protocol":   "grpc",
+		"timeout":    "2s",
+		"batch-size": 1,
+		"interval":   "50ms",
+	}
+
+	o := &otlpOutput{}
+	require.NoError(t, o.Init(context.Background(), "test-dynCfg-no-apply", cfg1,
+		outputs.WithLogger(log.New(io.Discard, "", 0)),
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	))
+	defer o.Close()
+
+	// Capture baseline state pointer and dynCfg pointer.
+	s1 := o.state.Load()
+	prevDC := o.dynCfg.Load()
+	require.NotNil(t, s1)
+	require.NotNil(t, prevDC)
+
+	// Attempt Update: switch to http with an ftp:// endpoint.
+	// This passes validateConfig (protocol "http" is valid) but fails in
+	// initHTTPFor → resolveMetricsURL with "unsupported endpoint scheme".
+	badCfg := map[string]interface{}{
+		"endpoint":   "ftp://127.0.0.1:4318",
+		"protocol":   "http",
+		"timeout":    "2s",
+		"batch-size": 1,
+		"interval":   "50ms",
+	}
+	err := o.Update(context.Background(), badCfg)
+
+	// 1. Update must return an error.
+	require.Error(t, err, "Update must fail on ftp:// endpoint scheme")
+	require.Contains(t, err.Error(), "unsupported endpoint scheme")
+
+	// 2. dynCfg must NOT have been updated — pointer identity must be preserved.
+	require.Same(t, prevDC, o.dynCfg.Load(),
+		"dynCfg must not be updated when transport rebuild fails")
+
+	// 3. state must NOT have been updated — original state pointer must be preserved.
+	require.Same(t, s1, o.state.Load(),
+		"state must not be updated when transport rebuild fails")
+}

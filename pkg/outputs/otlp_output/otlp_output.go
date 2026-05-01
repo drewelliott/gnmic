@@ -393,6 +393,7 @@ func (o *otlpOutput) Update(ctx context.Context, cfg map[string]any) error {
 	rebuildTransport := needsTransportRebuild(currCfg, newCfg)
 	rebuildProcessors := currCfg == nil || slices.Compare(currCfg.EventProcessors, newCfg.EventProcessors) != 0
 
+	// Build the new dynamic config into a local — do NOT publish yet.
 	dc := new(dynConfig)
 	prevDC := o.dynCfg.Load()
 	if rebuildProcessors {
@@ -403,8 +404,11 @@ func (o *otlpOutput) Update(ctx context.Context, cfg map[string]any) error {
 	} else if prevDC != nil {
 		dc.evps = prevDC.evps
 	}
-	o.dynCfg.Store(dc)
 
+	// Build the new transport into a local if a rebuild is needed — also do
+	// NOT publish yet. All fallible work must complete before any state is
+	// applied so that no error path leaves dynCfg or state mid-update.
+	//
 	// Publish the new outputState atomically. Two paths:
 	//   1) needsTransportRebuild → build a fresh transport and Swap. Workers
 	//      holding the old state reference can finish their batches; we
@@ -413,11 +417,18 @@ func (o *otlpOutput) Update(ctx context.Context, cfg map[string]any) error {
 	//      Timeout × (MaxRetries+1) + maxRetryAfter.
 	//   2) Otherwise (e.g. batch-size, resource-tag-keys) → reuse the
 	//      transport pointers from the old state. No close, no rebuild.
+	var newState *outputState
 	if rebuildTransport {
-		newState, err := o.buildOutputState(newCfg)
+		newState, err = o.buildOutputState(newCfg)
 		if err != nil {
 			return fmt.Errorf("failed to build new transport state: %w", err)
 		}
+	}
+
+	// All fallible work is done. Publish dynCfg first, then the new outputState.
+	o.dynCfg.Store(dc)
+
+	if rebuildTransport {
 		o.stateMu.Lock()
 		oldState := o.state.Swap(newState)
 		o.stateMu.Unlock()
@@ -441,14 +452,14 @@ func (o *otlpOutput) Update(ctx context.Context, cfg map[string]any) error {
 		// nil-currState is unreachable in practice (needsTransportRebuild
 		// returns true on nil, taking the rebuild branch above); the guard
 		// below is defensive.
-		newState := &outputState{cfg: newCfg}
+		nextState := &outputState{cfg: newCfg}
 		if currState != nil {
-			newState.transport = currState.transport
+			nextState.transport = currState.transport
 		}
 		o.stateMu.Lock()
-		o.state.Store(newState)
+		o.state.Store(nextState)
 		o.stateMu.Unlock()
-		// No cleanup — the transport is still live and shared with newState.
+		// No cleanup — the transport is still live and shared with nextState.
 	}
 
 	if swapChannel || restartWorkers {
