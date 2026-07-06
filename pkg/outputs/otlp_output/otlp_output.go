@@ -801,7 +801,11 @@ retry:
 			select {
 			case <-time.After(sleep):
 			case <-ctx.Done():
-				return
+				// Cancelled mid-retry (worker restart or Close). Fall through
+				// to the failure path so the dropped batch is logged and
+				// counted rather than silently lost from the accounting.
+				err = ctx.Err()
+				break retry
 			}
 		}
 	}

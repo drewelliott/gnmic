@@ -1043,8 +1043,11 @@ func TestSendBatch_ContextCancelledDuringRetryWait(t *testing.T) {
 	defer srv.Close()
 
 	o := newHTTPTestOutput(t, srv)
+	const name = "cancelled-retry-accounting"
 	withCfg(o, func(c *config) {
 		c.MaxRetries = 5
+		c.EnableMetrics = true
+		c.Name = name
 		c.resourceTagSet = map[string]bool{}
 	})
 
@@ -1066,6 +1069,12 @@ func TestSendBatch_ContextCancelledDuringRetryWait(t *testing.T) {
 
 	// Cancellation should land well before the 5-second Retry-After elapses.
 	require.Less(t, elapsed, 2*time.Second, "ctx cancel must interrupt the retry sleep")
+
+	// The cancelled batch was dropped — it must be counted as failed, not
+	// silently lost from the accounting.
+	require.Equal(t, float64(len(events)),
+		testutil.ToFloat64(otlpNumberOfFailedEvents.WithLabelValues(name, "send_failed")),
+		"batch dropped by cancellation must be counted as failed")
 }
 
 func TestOTLP_InitHTTPTransport_Succeeds(t *testing.T) {
