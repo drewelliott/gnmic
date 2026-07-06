@@ -1536,3 +1536,121 @@ func TestUpdate_TwoStepReload_TransportSharedAcrossConfigOnly(t *testing.T) {
 		t.Fatal("cleanup never fired after the in-flight batch completed")
 	}
 }
+
+// Security: redirects must never be followed. A redirecting (or compromised)
+// collector could otherwise pull the metrics payload and user-defined headers
+// (which Go forwards cross-host, unlike Authorization) to another origin —
+// 307/308 replay the POST body. CheckRedirect returns ErrUseLastResponse, so
+// the 3xx surfaces as a response and classifies as a permanent error.
+func TestSendHTTP_RedirectNotFollowed(t *testing.T) {
+	var redirectTargetHits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectTargetHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	var originHits atomic.Int32
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		originHits.Add(1)
+		w.Header().Set("Location", target.URL+"/v1/metrics")
+		w.WriteHeader(http.StatusPermanentRedirect)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	err := o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{})
+	require.Error(t, err)
+
+	var hee *httpExportError
+	require.ErrorAs(t, err, &hee)
+	require.Equal(t, http.StatusPermanentRedirect, hee.status)
+	require.True(t, isPermanentHTTPError(err), "3xx must classify as permanent, not retryable")
+	require.Equal(t, int32(1), originHits.Load(), "origin must receive exactly one request")
+	require.Equal(t, int32(0), redirectTargetHits.Load(), "redirect target must never be contacted")
+}
+
+// Contract: Content-Encoding is protocol-owned in both directions. With
+// compression: none, a user-supplied Content-Encoding (any case — Header.Set
+// canonicalizes) must be stripped, or the raw protobuf body is mislabelled
+// and the collector tries to gunzip it.
+func TestSendHTTP_UserContentEncodingStrippedWhenNoCompression(t *testing.T) {
+	var gotEncoding string
+	var gotBody []byte
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		gotEncoding = r.Header.Get("Content-Encoding")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	withCfg(o, func(c *config) {
+		c.Compression = "none"
+		// lowercase on purpose: canonicalization must not defeat the strip
+		c.Headers = map[string]string{"content-encoding": "gzip"}
+	})
+
+	require.NoError(t, o.sendHTTP(context.Background(), o.state.Load(), &metricsv1.ExportMetricsServiceRequest{}))
+	require.Empty(t, gotEncoding, "user Content-Encoding must be stripped when compression is none")
+	var roundtrip metricsv1.ExportMetricsServiceRequest
+	require.NoError(t, proto.Unmarshal(gotBody, &roundtrip), "body must be raw (uncompressed) protobuf")
+}
+
+// Accounting: PartialSuccess is request-level success — the server durably
+// accepted everything except the rejected points. The batch counts toward
+// sent_events (even when every point was rejected); the loss signal lives in
+// rejected_data_points_total, and failed_events stays untouched. Data-loss
+// alerting must watch the rejected counter, not the sent/failed pair.
+func TestSendBatch_PartialSuccessCountsSent(t *testing.T) {
+	respBody, err := proto.Marshal(&metricsv1.ExportMetricsServiceResponse{
+		PartialSuccess: &metricsv1.ExportMetricsPartialSuccess{
+			RejectedDataPoints: 2,
+			ErrorMessage:       "all points rejected",
+		},
+	})
+	require.NoError(t, err)
+
+	var hits atomic.Int32
+	srv := newMTLSTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(respBody)
+	})
+	defer srv.Close()
+
+	o := newHTTPTestOutput(t, srv)
+	const name = "partial-success-accounting"
+	withCfg(o, func(c *config) {
+		c.EnableMetrics = true
+		c.Name = name
+		c.MaxRetries = 3
+		c.resourceTagSet = map[string]bool{}
+	})
+
+	events := []*formatters.EventMsg{
+		{
+			Name: "test", Timestamp: time.Now().UnixNano(),
+			Tags:   map[string]string{"source": "x"},
+			Values: map[string]interface{}{"a": int64(1)},
+		},
+		{
+			Name: "test", Timestamp: time.Now().UnixNano(),
+			Tags:   map[string]string{"source": "x"},
+			Values: map[string]interface{}{"b": int64(2)},
+		},
+	}
+	o.sendBatch(context.Background(), events)
+
+	require.Equal(t, int32(1), hits.Load(), "partial success must not be retried")
+	require.Equal(t, float64(len(events)),
+		testutil.ToFloat64(otlpNumberOfSentEvents.WithLabelValues(name)),
+		"partially-successful batch must count as sent")
+	require.Equal(t, float64(0),
+		testutil.ToFloat64(otlpNumberOfFailedEvents.WithLabelValues(name, "send_failed")),
+		"partially-successful batch must not count as failed")
+	require.Equal(t, float64(2),
+		testutil.ToFloat64(otlpRejectedDataPoints.WithLabelValues(name)),
+		"rejected points must be counted on the dedicated counter")
+}

@@ -1878,3 +1878,122 @@ func TestInit_GRPCBareEndpointWithoutPortRejected(t *testing.T) {
 		})
 	}
 }
+
+// Security: String() feeds the reload log (Update logs the marshaled config
+// at Info level), and Headers carries credentials such as Authorization
+// bearer tokens. Values must be redacted — for every header, not just a
+// blocklist — while key names stay visible for debugging. The live config
+// must not be mutated by the redaction.
+func TestString_RedactsHeaderValues(t *testing.T) {
+	o := &otlpOutput{}
+	o.initFields()
+	headers := map[string]string{
+		"Authorization": "Bearer super-secret-token",
+		"X-Api-Key":     "another-secret-value",
+		"X-Scope-OrgID": "tenant-1",
+	}
+	cfg := &config{Name: "redaction-test", Endpoint: "collector:4318", Headers: headers}
+	o.state.Store(&outputState{cfg: cfg})
+
+	s := o.String()
+	require.NotEmpty(t, s)
+	for k := range headers {
+		require.Contains(t, s, k, "header names must stay visible")
+	}
+	for _, v := range headers {
+		require.NotContains(t, s, v, "header values must never appear in String()")
+	}
+	require.Contains(t, s, "***")
+
+	// The redaction must operate on a copy.
+	require.Equal(t, "Bearer super-secret-token", cfg.Headers["Authorization"],
+		"live config must not be mutated")
+}
+
+// Config guard: a negative numeric value would otherwise panic at runtime —
+// buffer-size in make(chan) and num-workers in wg.Add at Init; batch-size in
+// make([]) and interval in time.NewTicker inside the worker goroutine, where
+// an unrecovered panic kills the process. Negative timeout disables deadlines
+// and negative max-retries silently drops every batch. All must be rejected
+// at validation time. Zero is not covered here: setDefaultsFor replaces zero
+// with the default before validateConfig runs.
+func TestValidateConfig_RejectsInvalidNumerics(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*config)
+		want   string
+	}{
+		{"negative batch-size", func(c *config) { c.BatchSize = -1 }, "batch-size"},
+		{"negative buffer-size", func(c *config) { c.BufferSize = -1 }, "buffer-size"},
+		{"negative num-workers", func(c *config) { c.NumWorkers = -1 }, "num-workers"},
+		{"negative interval", func(c *config) { c.Interval = -time.Second }, "interval"},
+		{"negative timeout", func(c *config) { c.Timeout = -time.Second }, "timeout"},
+		{"negative max-retries", func(c *config) { c.MaxRetries = -1 }, "max-retries"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o := &otlpOutput{}
+			c := &config{Endpoint: "collector:4317"}
+			tc.mutate(c)
+			o.setDefaultsFor(c)
+			err := o.validateConfig(c)
+			require.Error(t, err)
+			require.Contains(t, err.Error(), tc.want)
+		})
+	}
+
+	// Sanity: defaults alone validate cleanly.
+	o := &otlpOutput{}
+	c := &config{Endpoint: "collector:4317"}
+	o.setDefaultsFor(c)
+	require.NoError(t, o.validateConfig(c))
+}
+
+// Race regression: the outputs manager dispatches Write/WriteEvent goroutines
+// without synchronizing against Close (go mgr.write(e) in outputs_manager.go),
+// so producers can still be sending while — and after — Close runs. Close
+// must not close the event channel (send on closed channel panics the whole
+// process even inside a select) and Write/WriteEvent must tolerate the
+// post-Close nil state. Run under -race, this also proves the paths are
+// data-race free.
+func TestClose_ConcurrentWriteEventDoesNotPanic(t *testing.T) {
+	server, endpoint := startMockOTLPServer(t)
+	defer server.Stop()
+
+	cfg := map[string]interface{}{
+		"endpoint": endpoint,
+		"protocol": "grpc",
+		"interval": "50ms",
+	}
+	o := &otlpOutput{}
+	require.NoError(t, o.Init(context.Background(), "close-race", cfg,
+		outputs.WithConfigStore(gomap.NewMemStore(store.StoreOptions[any]{})),
+	))
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ev := createTestEvent()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					o.WriteEvent(context.Background(), ev)
+				}
+			}
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	require.NoError(t, o.Close())
+	// Producers keep hammering after Close — must neither panic nor race.
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	require.NoError(t, o.Close(), "Close must stay idempotent")
+}

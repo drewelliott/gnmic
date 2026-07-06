@@ -232,6 +232,17 @@ func (o *otlpOutput) initHTTPFor(cfg *config) (*httpClientState, error) {
 		Transport: transport,
 		// No client-side Timeout: per-request context timeout is the authoritative deadline,
 		// matching the gRPC path (which uses context.WithTimeout in sendGRPC).
+		//
+		// Never follow redirects. Go strips Authorization on cross-host
+		// redirects but forwards user-defined headers (e.g. X-Scope-OrgID or
+		// custom credential headers), and a 307/308 replays the POST body —
+		// a redirecting (or compromised) collector must not be able to pull
+		// the payload and headers to another origin. ErrUseLastResponse
+		// surfaces the 3xx as a regular response, which the status
+		// classification in sendHTTP treats as a permanent error.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
 	// Pass the already-trimmed `endpoint` through (not cfg.Endpoint) so the
@@ -301,6 +312,12 @@ func (o *otlpOutput) sendHTTP(ctx context.Context, state *outputState, req *metr
 	httpReq.Header.Set("Content-Type", "application/x-protobuf")
 	if useGzip {
 		httpReq.Header.Set("Content-Encoding", "gzip")
+	} else {
+		// Content-Encoding is protocol-owned in both directions: a
+		// user-supplied value would mislabel the uncompressed body.
+		// Header.Set canonicalizes names, so this also catches
+		// "content-encoding" etc.
+		httpReq.Header.Del("Content-Encoding")
 	}
 
 	resp, err := hs.client.Do(httpReq)

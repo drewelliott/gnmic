@@ -249,6 +249,18 @@ func (o *otlpOutput) loadCfg() *config {
 
 func (o *otlpOutput) String() string {
 	cfg := o.loadCfg()
+	// Redact header values: operators put credentials in Headers (the docs
+	// recommend "Authorization: Bearer <token>"), and String() output lands
+	// in the reload log at Info level. Key names stay visible for debugging;
+	// values never do. The copy leaves the live config untouched.
+	if cfg != nil && len(cfg.Headers) > 0 {
+		redacted := *cfg
+		redacted.Headers = make(map[string]string, len(cfg.Headers))
+		for k := range cfg.Headers {
+			redacted.Headers[k] = "***"
+		}
+		cfg = &redacted
+	}
 	b, err := json.Marshal(cfg)
 	if err != nil {
 		return ""
@@ -554,7 +566,10 @@ func (o *otlpOutput) Write(ctx context.Context, rsp proto.Message, meta outputs.
 
 	cfg := o.loadCfg()
 	dc := o.dynCfg.Load()
-	if dc == nil {
+	if cfg == nil || dc == nil {
+		// nil cfg means Close already ran (state swapped to nil) or Init
+		// never did — either way this write has nowhere to go. Drop it
+		// rather than dereferencing nil on the channel-full path below.
 		return
 	}
 
@@ -600,6 +615,10 @@ func (o *otlpOutput) WriteEvent(ctx context.Context, ev *formatters.EventMsg) {
 	}
 
 	cfg := o.loadCfg()
+	if cfg == nil {
+		// Close already ran (or Init never did) — drop, see Write.
+		return
+	}
 	eventCh := *o.eventCh.Load()
 
 	select {
@@ -621,10 +640,13 @@ func (o *otlpOutput) Close() error {
 		o.cancelFn = nil
 	}
 
-	// Close event channel once.
-	if ch := o.eventCh.Swap(nil); ch != nil {
-		close(*ch)
-	}
+	// Deliberately do NOT close the event channel: the outputs manager
+	// dispatches Write/WriteEvent goroutines without synchronizing against
+	// Close, and a send on a closed channel panics the whole process (a
+	// select with a default case does not protect against that). Workers
+	// exit via the context cancellation above; the channel stays live so a
+	// straggling producer just fills the buffer and falls into the
+	// non-blocking drop path in Write/WriteEvent.
 
 	// Wait for workers to finish
 	o.wg.Wait()
@@ -751,17 +773,23 @@ retry:
 
 		if err == nil {
 			o.logger.Debug("successfully sent events", "count", len(events), "attempt", attempt+1)
-			if cfg.EnableMetrics {
-				otlpNumberOfSentEvents.WithLabelValues(cfg.Name).Add(float64(len(events)))
-				otlpSendDuration.WithLabelValues(cfg.Name).Observe(time.Since(start).Seconds())
-			}
+			o.recordBatchSent(cfg, len(events), start)
 			return
 		}
 
-		// Permanent errors abort the loop. isPermanentHTTPError covers HTTP status
-		// classification; isPartialSuccessError covers PartialSuccess on either
-		// transport (gRPC and HTTP both can return *partialSuccessError).
-		if isPermanentHTTPError(err) || isPartialSuccessError(err) {
+		// PartialSuccess means the server accepted the request and durably
+		// stored everything except the rejected points, which were already
+		// counted in otlpRejectedDataPoints and logged at the response site.
+		// The batch counts as sent (request-level accounting); retrying would
+		// duplicate the accepted points. Data-loss monitoring belongs on the
+		// rejected-data-points counter, not the sent/failed pair.
+		if isPartialSuccessError(err) {
+			o.recordBatchSent(cfg, len(events), start)
+			return
+		}
+
+		// Permanent HTTP errors (non-retryable status codes) abort the loop.
+		if isPermanentHTTPError(err) {
 			o.logger.Debug("permanent error, not retrying", "err", err)
 			break
 		}
@@ -782,6 +810,18 @@ retry:
 	if cfg.EnableMetrics {
 		otlpNumberOfFailedEvents.WithLabelValues(cfg.Name, "send_failed").Add(float64(len(events)))
 	}
+}
+
+// recordBatchSent counts a batch as delivered and observes the send duration.
+// Shared by the full-success and partial-success paths in sendBatch so the
+// two cannot drift apart; in the partial case the loss is accounted
+// separately in otlpRejectedDataPoints.
+func (o *otlpOutput) recordBatchSent(cfg *config, count int, start time.Time) {
+	if !cfg.EnableMetrics {
+		return
+	}
+	otlpNumberOfSentEvents.WithLabelValues(cfg.Name).Add(float64(count))
+	otlpSendDuration.WithLabelValues(cfg.Name).Observe(time.Since(start).Seconds())
 }
 
 func (o *otlpOutput) setDefaultsFor(c *config) {
@@ -833,6 +873,32 @@ func (o *otlpOutput) validateConfig(c *config) error {
 	}
 	if c.Endpoint == "" {
 		return fmt.Errorf("endpoint is required")
+	}
+	// Numeric bounds. validateConfig runs after setDefaultsFor, so zero
+	// values have already been replaced by defaults — anything non-positive
+	// here is an explicit operator error. Without these checks a negative
+	// value panics at runtime: buffer-size in make(chan) and num-workers in
+	// wg.Add at Init; batch-size in make([]) and interval in time.NewTicker
+	// inside the worker goroutine, where an unrecovered panic kills the
+	// whole process. Negative timeout silently disables deadlines and
+	// negative max-retries silently drops every batch.
+	if c.Timeout <= 0 {
+		return fmt.Errorf("invalid timeout %s: must be positive", c.Timeout)
+	}
+	if c.BatchSize <= 0 {
+		return fmt.Errorf("invalid batch-size %d: must be positive", c.BatchSize)
+	}
+	if c.Interval <= 0 {
+		return fmt.Errorf("invalid interval %s: must be positive", c.Interval)
+	}
+	if c.BufferSize <= 0 {
+		return fmt.Errorf("invalid buffer-size %d: must be positive", c.BufferSize)
+	}
+	if c.NumWorkers <= 0 {
+		return fmt.Errorf("invalid num-workers %d: must be positive", c.NumWorkers)
+	}
+	if c.MaxRetries < 0 {
+		return fmt.Errorf("invalid max-retries %d: must not be negative", c.MaxRetries)
 	}
 	c.counterRegexes = make([]*regexp.Regexp, 0, len(c.CounterPatterns))
 	for _, p := range c.CounterPatterns {

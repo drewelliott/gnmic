@@ -55,7 +55,7 @@ outputs:
 | `tls` | unset | TLS configuration. Supports `ca-file`, `cert-file`, `key-file`, and `skip-verify`. |
 | `batch-size` | `1000` | Number of events to buffer before sending a batch. |
 | `interval` | `5s` | Maximum time to wait before sending a non-empty batch. |
-| `buffer-size` | `2 * batch-size` | Size of the internal event channel. |
+| `buffer-size` | `2 * batch-size` | Size of the internal event channel. Changing it on a live config reload swaps the channel and may drop events still buffered in the old one. |
 | `max-retries` | `3` | Number of retry attempts after the first export attempt fails. |
 | `compression` | `gzip` for HTTP | HTTP request body compression. One of `gzip` or `none`. Ignored by OTLP/gRPC. |
 | `metric-prefix` | unset | Prefix added to generated metric names. |
@@ -107,6 +107,8 @@ protocol: http
 If the path is empty or `/`, it defaults to `/v1/metrics`.
 
 Only `http` and `https` URL schemes are accepted for OTLP/HTTP. User information in URLs is rejected; use `headers` for authentication data.
+
+HTTP redirects are never followed: a redirect response is treated as a permanent export failure. This prevents a redirecting endpoint from receiving the metrics payload and configured headers at a different origin.
 
 ## TLS and Compression
 
@@ -225,6 +227,8 @@ outputs:
 
 For OTLP/HTTP, user-supplied headers cannot override the required OTLP `Content-Type` or `Content-Encoding` headers.
 
+Header values are treated as credentials: `gnmic` redacts them in its own log output (header names remain visible).
+
 ## Retries and Partial Success
 
 `max-retries` applies to both OTLP/gRPC and OTLP/HTTP.
@@ -232,6 +236,8 @@ For OTLP/HTTP, user-supplied headers cannot override the required OTLP `Content-
 For OTLP/HTTP, retryable status codes are `429`, `502`, `503`, and `504`. Other HTTP status codes are treated as permanent failures. When a retryable response includes a `Retry-After` header, `gnmic` honors it up to an internal cap of 30 seconds; otherwise it uses exponential backoff with jitter.
 
 OTLP `PartialSuccess` responses with rejected data points are not retried for either OTLP/gRPC or OTLP/HTTP. When output metrics are enabled, rejected data points are counted by `gnmic_otlp_output_rejected_data_points_total`.
+
+A `PartialSuccess` response counts as a delivered export: the batch is accounted in `gnmic_otlp_output_number_of_sent_events_total` (the sent/failed counters track export requests at event granularity), while the partial loss is reported exclusively by `gnmic_otlp_output_rejected_data_points_total`. Alert on the rejected counter to detect data loss — a batch whose data points are all rejected still counts as sent.
 
 ## Output Metrics
 
