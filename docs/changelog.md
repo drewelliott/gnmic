@@ -5,6 +5,12 @@ tags:
 
 ## Changelog
 
+### Unreleased
+
+- Outputs:
+
+    - OTLP: client mTLS certificates are reloaded from `cert-file` and `key-file` on new TLS handshakes when the files change. The optional `tls.reload-interval` duration also refreshes the cached pair proactively, allowing exports to recover after certificate rotation and reconnect without restarting gnmic.
+
 ### v0.49.0 - 16 September 2026
 
 - gNMI server:
