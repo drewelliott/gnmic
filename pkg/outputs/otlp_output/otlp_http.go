@@ -189,8 +189,9 @@ func resolveMetricsURL(endpoint string, tlsEnabled bool) (string, error) {
 // (e.g. tenant rotation) takes effect on the next batch without a transport
 // rebuild.
 type httpClientState struct {
-	client   *http.Client
-	endpoint string
+	client       *http.Client
+	endpoint     string
+	certReloader *clientCertificateReloader
 }
 
 func (o *otlpOutput) initHTTPFor(cfg *config) (*httpClientState, error) {
@@ -204,9 +205,10 @@ func (o *otlpOutput) initHTTPFor(cfg *config) (*httpClientState, error) {
 	}
 
 	var tlsConfig *tls.Config
+	var certReloader *clientCertificateReloader
 	if cfg.TLS != nil {
 		var err error
-		tlsConfig, err = o.createTLSConfigFor(cfg)
+		tlsConfig, certReloader, err = o.createTLSConfigFor(cfg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TLS config: %w", err)
 		}
@@ -249,11 +251,12 @@ func (o *otlpOutput) initHTTPFor(cfg *config) (*httpClientState, error) {
 	// coherence check above and URL resolution operate on the same string.
 	resolvedURL, err := resolveMetricsURL(endpoint, cfg.TLS != nil)
 	if err != nil {
+		certReloader.close()
 		return nil, err
 	}
 
 	o.logger.Info("initialized OTLP HTTP client", "endpoint", resolvedURL)
-	return &httpClientState{client: client, endpoint: resolvedURL}, nil
+	return &httpClientState{client: client, endpoint: resolvedURL, certReloader: certReloader}, nil
 }
 
 func (o *otlpOutput) sendHTTP(ctx context.Context, state *outputState, req *metricsv1.ExportMetricsServiceRequest) error {

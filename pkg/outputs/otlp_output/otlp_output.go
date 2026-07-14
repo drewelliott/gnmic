@@ -121,10 +121,16 @@ func (t *transportState) cleanup() {
 	if t.grpcState != nil && t.grpcState.conn != nil {
 		_ = t.grpcState.conn.Close()
 	}
+	if t.grpcState != nil {
+		t.grpcState.certReloader.close()
+	}
 	if t.httpState != nil && t.httpState.client != nil {
 		if tr, ok := t.httpState.client.Transport.(*http.Transport); ok {
 			tr.CloseIdleConnections()
 		}
+	}
+	if t.httpState != nil {
+		t.httpState.certReloader.close()
 	}
 }
 
@@ -150,8 +156,9 @@ type dynConfig struct {
 }
 
 type grpcClientState struct {
-	conn   *grpc.ClientConn
-	client metricsv1.MetricsServiceClient
+	conn         *grpc.ClientConn
+	client       metricsv1.MetricsServiceClient
+	certReloader *clientCertificateReloader
 }
 
 // config holds the OTLP output configuration
@@ -904,6 +911,14 @@ func (o *otlpOutput) validateConfig(c *config) error {
 	if c.MaxRetries < 0 {
 		return fmt.Errorf("invalid max-retries %d: must not be negative", c.MaxRetries)
 	}
+	if c.TLS != nil {
+		if (c.TLS.CertFile == "") != (c.TLS.KeyFile == "") {
+			return fmt.Errorf("tls cert-file and key-file must be set together")
+		}
+		if c.TLS.ReloadInterval < 0 {
+			return fmt.Errorf("invalid tls reload-interval %s: must not be negative", c.TLS.ReloadInterval)
+		}
+	}
 	c.counterRegexes = make([]*regexp.Regexp, 0, len(c.CounterPatterns))
 	for _, p := range c.CounterPatterns {
 		re, err := regexp.Compile(p)
@@ -942,12 +957,14 @@ func (o *otlpOutput) initGRPCFor(cfg *config) (*grpcClientState, error) {
 	}
 
 	var opts []grpc.DialOption
+	var certReloader *clientCertificateReloader
 
 	if cfg.TLS != nil {
-		tlsConfig, err := o.createTLSConfigFor(cfg)
+		tlsConfig, reloader, err := o.createTLSConfigFor(cfg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TLS config: %w", err)
 		}
+		certReloader = reloader
 		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
 	} else {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -955,34 +972,66 @@ func (o *otlpOutput) initGRPCFor(cfg *config) (*grpcClientState, error) {
 
 	conn, err := grpc.NewClient(endpoint, opts...)
 	if err != nil {
+		certReloader.close()
 		return nil, fmt.Errorf("failed to create OTLP client: %w", err)
 	}
 
 	o.logger.Info("initialized OTLP gRPC client", "endpoint", cfg.Endpoint)
 	return &grpcClientState{
-		conn:   conn,
-		client: metricsv1.NewMetricsServiceClient(conn),
+		conn:         conn,
+		client:       metricsv1.NewMetricsServiceClient(conn),
+		certReloader: certReloader,
 	}, nil
 }
 
-func (o *otlpOutput) createTLSConfigFor(cfg *config) (*tls.Config, error) {
+func (o *otlpOutput) createTLSConfigFor(cfg *config) (*tls.Config, *clientCertificateReloader, error) {
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: cfg.TLS.SkipVerify,
 	}
 
-	if cfg.TLS.CaFile != "" || cfg.TLS.CertFile != "" {
-		return utils.NewTLSConfig(
-			cfg.TLS.CaFile,
+	if (cfg.TLS.CertFile == "") != (cfg.TLS.KeyFile == "") {
+		return nil, nil, fmt.Errorf("tls cert-file and key-file must be set together")
+	}
+
+	if cfg.TLS.CertFile != "" && cfg.TLS.KeyFile != "" {
+		if cfg.TLS.CaFile != "" {
+			certPool, err := utils.LoadCACertificates(cfg.TLS.CaFile)
+			if err != nil {
+				return nil, nil, err
+			}
+			tlsConfig.RootCAs = certPool
+		}
+
+		certReloader, err := newClientCertificateReloader(
 			cfg.TLS.CertFile,
 			cfg.TLS.KeyFile,
+			cfg.TLS.ReloadInterval,
+			o.logger,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		tlsConfig.GetClientCertificate = certReloader.getClientCertificate
+		return tlsConfig, certReloader, nil
+	}
+
+	// Preserve the shared helper's CA behavior when no client certificate is
+	// configured. Other callers of NewTLSConfig remain unchanged; only OTLP
+	// mTLS opts in to the callback above.
+	if cfg.TLS.CaFile != "" {
+		sharedTLSConfig, err := utils.NewTLSConfig(
+			cfg.TLS.CaFile,
+			"",
+			"",
 			"",
 			cfg.TLS.SkipVerify,
 			false,
 			false,
 		)
+		return sharedTLSConfig, nil, err
 	}
 
-	return tlsConfig, nil
+	return tlsConfig, nil, nil
 }
 
 // unregisterMetrics removes only the collectors this instance successfully
@@ -1060,5 +1109,13 @@ func needsTransportRebuild(old, nw *config) bool {
 	return old.Endpoint != nw.Endpoint ||
 		old.Protocol != nw.Protocol ||
 		old.Compression != nw.Compression ||
-		!old.TLS.Equal(nw.TLS)
+		!old.TLS.Equal(nw.TLS) ||
+		tlsReloadInterval(old.TLS) != tlsReloadInterval(nw.TLS)
+}
+
+func tlsReloadInterval(cfg *types.TLSConfig) time.Duration {
+	if cfg == nil {
+		return 0
+	}
+	return cfg.ReloadInterval
 }

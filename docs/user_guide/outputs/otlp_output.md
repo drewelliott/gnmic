@@ -48,6 +48,7 @@ outputs:
       ca-file: /etc/gnmic/certs/ca.crt
       cert-file: /etc/gnmic/certs/client.crt
       key-file: /etc/gnmic/certs/client.key
+      reload-interval: 1m
 ```
 
 ## Configuration Reference
@@ -58,7 +59,7 @@ outputs:
 | `endpoint` | required | OTLP endpoint. Bare endpoints must be `host:port`. |
 | `protocol` | `grpc` | Transport protocol. One of `grpc` or `http`. |
 | `timeout` | `10s` | Timeout for each export attempt. |
-| `tls` | unset | TLS configuration. Supports `ca-file`, `cert-file`, `key-file`, and `skip-verify`. |
+| `tls` | unset | TLS configuration. Supports `ca-file`, `cert-file`, `key-file`, `skip-verify`, and `reload-interval`. |
 | `batch-size` | `1000` | Number of events to buffer before sending a batch. |
 | `interval` | `5s` | Maximum time to wait before sending a non-empty batch. |
 | `buffer-size` | `2 * batch-size` | Size of the internal event channel. Changing it on a live config reload swaps the channel and may drop events still buffered in the old one. |
@@ -119,6 +120,21 @@ HTTP redirects are never followed: a redirect response is treated as a permanent
 ## TLS and Compression
 
 The `tls` block applies to both OTLP/gRPC and OTLP/HTTP.
+
+When both `cert-file` and `key-file` are configured, gnmic checks their
+modification times and sizes before every new TLS handshake and reloads a
+changed pair without rebuilding the output or restarting the process. Set the
+optional `reload-interval` to a Go duration such as `1m` to also check for a
+changed pair proactively. Its default is `0`, which disables periodic checks;
+the on-handshake check remains enabled. If a changed pair is temporarily
+unreadable or invalid, gnmic logs the reload failure, keeps the last
+successfully loaded pair, and retries the reload on the next check.
+
+Certificate reload does not interrupt an established HTTP keep-alive or gRPC
+connection. The new pair is presented when a transport error causes the client
+to reconnect and perform another TLS handshake. The `ca-file` is not hot
+reloaded; changing its configured path through gnmic's config reload rebuilds
+the transport as before.
 
 For OTLP/HTTP, do not configure an `http://` URL with a `tls` block. Use a bare `host:port` endpoint or an `https://` URL when TLS is required.
 

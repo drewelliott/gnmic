@@ -1,6 +1,9 @@
 package types
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 type TLSConfig struct {
 	CaFile     string `mapstructure:"ca-file,omitempty"`
@@ -8,6 +11,11 @@ type TLSConfig struct {
 	CertFile   string `mapstructure:"cert-file,omitempty"`
 	SkipVerify bool   `mapstructure:"skip-verify,omitempty"`
 	ClientAuth string `mapstructure:"client-auth,omitempty"`
+	// ReloadInterval controls proactive client certificate reload checks for
+	// components that opt in to certificate hot reload. A zero value disables
+	// periodic checks. Opt-in components compare this field separately so it
+	// does not change reload behavior for unrelated TLS consumers.
+	ReloadInterval time.Duration `mapstructure:"reload-interval,omitempty"`
 }
 
 func (t *TLSConfig) Validate() error {
