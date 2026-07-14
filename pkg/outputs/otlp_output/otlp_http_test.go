@@ -81,12 +81,16 @@ func TestMTLSHarness_ClientWithoutCertIsRejected(t *testing.T) {
 // so they can be passed through TLSConfig.CaFile / CertFile / KeyFile.
 type mTLSTestServer struct {
 	*httptest.Server
-	caPool      *x509.CertPool
-	caPEMPath   string
-	cliCertPEM  []byte
-	cliKeyPEM   []byte
-	cliCertPath string
-	cliKeyPath  string
+	caPool              *x509.CertPool
+	caCert              *x509.Certificate
+	caKey               *ecdsa.PrivateKey
+	clientCert          *x509.Certificate
+	allowedClientSerial *atomic.Pointer[string]
+	caPEMPath           string
+	cliCertPEM          []byte
+	cliKeyPEM           []byte
+	cliCertPath         string
+	cliKeyPath          string
 }
 
 func newMTLSTestServer(t *testing.T, handler http.HandlerFunc) *mTLSTestServer {
@@ -103,11 +107,22 @@ func newMTLSTestServer(t *testing.T, handler http.HandlerFunc) *mTLSTestServer {
 	require.NoError(t, err)
 
 	srv := httptest.NewUnstartedServer(handler)
+	allowedClientSerial := new(atomic.Pointer[string])
 	srv.TLS = &tls.Config{
 		Certificates: []tls.Certificate{srvTLSCert},
 		ClientAuth:   tls.RequireAndVerifyClientCert,
 		ClientCAs:    caPool,
 		MinVersion:   tls.VersionTLS12,
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			allowed := allowedClientSerial.Load()
+			if allowed == nil {
+				return nil
+			}
+			if len(cs.PeerCertificates) == 0 || cs.PeerCertificates[0].SerialNumber.String() != *allowed {
+				return fmt.Errorf("client certificate is no longer accepted")
+			}
+			return nil
+		},
 	}
 	// Suppress expected TLS-handshake-rejection noise on stderr during tests
 	// like TestMTLSHarness_ClientWithoutCertIsRejected. Future tests reusing
@@ -124,13 +139,17 @@ func newMTLSTestServer(t *testing.T, handler http.HandlerFunc) *mTLSTestServer {
 	require.NoError(t, os.WriteFile(cliKeyPath, pemKey(clientKey), 0o600))
 
 	return &mTLSTestServer{
-		Server:      srv,
-		caPool:      caPool,
-		caPEMPath:   caPath,
-		cliCertPEM:  pemCert(clientCert),
-		cliKeyPEM:   pemKey(clientKey),
-		cliCertPath: cliCertPath,
-		cliKeyPath:  cliKeyPath,
+		Server:              srv,
+		caPool:              caPool,
+		caCert:              caCert,
+		caKey:               caKey,
+		clientCert:          clientCert,
+		allowedClientSerial: allowedClientSerial,
+		caPEMPath:           caPath,
+		cliCertPEM:          pemCert(clientCert),
+		cliKeyPEM:           pemKey(clientKey),
+		cliCertPath:         cliCertPath,
+		cliKeyPath:          cliKeyPath,
 	}
 }
 
@@ -138,6 +157,11 @@ func (s *mTLSTestServer) CAPool() *x509.CertPool { return s.caPool }
 func (s *mTLSTestServer) CAPath() string         { return s.caPEMPath }
 func (s *mTLSTestServer) ClientCertPath() string { return s.cliCertPath }
 func (s *mTLSTestServer) ClientKeyPath() string  { return s.cliKeyPath }
+
+func (s *mTLSTestServer) allowOnlyClientCertificate(cert *x509.Certificate) {
+	serial := cert.SerialNumber.String()
+	s.allowedClientSerial.Store(&serial)
+}
 
 // NewClient returns a plain http.Client with the server CA trusted and
 // the client cert loaded — useful for harness self-tests.
