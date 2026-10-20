@@ -10,6 +10,8 @@ package k8s_locker
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -21,6 +23,7 @@ import (
 	coordinationv1 "k8s.io/api/coordination/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/utils/ptr"
@@ -37,6 +40,23 @@ const (
 	defaultNamespace     = "default"
 	origKeyName          = "original-key"
 )
+
+// labelKeyFor returns the label key a Lease named nkey carries for its holder.
+//
+// A Lease name may be up to 253 characters, but a label key's name is limited
+// to 63, so a long cluster name plus a long target name gives a Lease name that
+// is valid yet a label key the API server rejects, and the target can then
+// never be locked. Such keys are replaced by a digest of the Lease name. Keys
+// that are already valid are kept unchanged, so every Lease that could be
+// created before is labelled exactly as before. Nothing selects Leases by this
+// label; they are always read by name.
+func labelKeyFor(nkey string) string {
+	if len(validation.IsQualifiedName(nkey)) == 0 {
+		return nkey
+	}
+	sum := sha256.Sum256([]byte(nkey))
+	return "gnmic-lock-" + hex.EncodeToString(sum[:])[:32]
+}
 
 func init() {
 	lockers.Register("k8s", func() lockers.Locker {
@@ -110,8 +130,8 @@ func (k *k8sLocker) Lock(ctx context.Context, key string, val []byte) (bool, err
 			Name:      nkey,
 			Namespace: k.Cfg.Namespace,
 			Labels: map[string]string{
-				"app": "gnmic",
-				nkey:  string(val),
+				"app":             "gnmic",
+				labelKeyFor(nkey): string(val),
 			},
 		},
 		Spec: coordinationv1.LeaseSpec{
