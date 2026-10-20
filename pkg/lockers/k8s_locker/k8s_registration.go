@@ -59,17 +59,19 @@ func (k *k8sLocker) List(ctx context.Context, prefix string) (map[string]string,
 	prefix = strings.ReplaceAll(prefix, "/", "-")
 	rs := make(map[string]string, len(ll.Items))
 	for _, l := range ll.Items {
-		for key, v := range l.Labels {
-			if key == "app" {
-				continue
-			}
-			if strings.HasPrefix(key, prefix) {
-				okey, ok := l.Annotations[origKeyName]
-				if ok {
-					rs[okey] = v
-					continue
-				}
-			}
+		// Match on the lock's own key, not its label key: Lock replaces a
+		// label key that is not a valid qualified name (labelKeyFor), and the
+		// holder is the value of whichever label key Lock used.
+		okey, ok := l.Annotations[origKeyName]
+		if !ok {
+			continue
+		}
+		nkey := strings.ReplaceAll(okey, "/", "-")
+		if !strings.HasPrefix(nkey, prefix) {
+			continue
+		}
+		if v, ok := l.Labels[labelKeyFor(nkey)]; ok {
+			rs[okey] = v
 		}
 	}
 	return rs, nil
